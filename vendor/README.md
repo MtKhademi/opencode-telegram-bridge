@@ -16,8 +16,8 @@ directly — no generator, no NuGet packages, fully offline build.
 chats?[chatId] = chat;
 ```
 
-Null-conditional assignment (`x?[i] = y` / `x?.y = z`) is a C# 14 feature. This project targets
-`net8.0` with an older compiler, so it was rewritten as:
+Null-conditional assignment (`x?[i] = y` / `x?.y = z`) is a C# 14 feature. At the time this patch
+was applied the project targeted `net8.0` with an older compiler, so it was rewritten as:
 
 ```csharp
 if (chats != null)
