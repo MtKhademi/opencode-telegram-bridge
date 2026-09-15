@@ -2,7 +2,6 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using OpenCodeTelegramBridge.Models;
@@ -105,7 +104,7 @@ public class OpenCodeManager : IDisposable
             _sessions.TryRemove(projectPath, out _);
 
         var config = _configStore.Current;
-        var port = GetFreeTcpPort();
+        var port = NetUtil.GetFreeTcpPort();
         var username = "opencode-bridge";
         var password = Convert.ToHexString(RandomNumberGeneratorBytes(24)).ToLowerInvariant();
 
@@ -338,15 +337,6 @@ public class OpenCodeManager : IDisposable
                 _ = StopAsync(path);
             }
         }
-    }
-
-    private static int GetFreeTcpPort()
-    {
-        var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
-        return port;
     }
 
     private static byte[] RandomNumberGeneratorBytes(int count)

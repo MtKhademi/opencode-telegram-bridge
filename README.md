@@ -4,16 +4,23 @@ A self-hosted, single-process C#/.NET app that lets you drive [OpenCode](https:/
 from Telegram — with a small local web dashboard. It uses the standard Telegram **Bot API**
 (via the [Telegram.Bot](https://github.com/TelegramBots/Telegram.Bot) NuGet package), so all you
 need is a bot token — no `api_id`/`api_hash` from my.telegram.org. When `api.telegram.org` itself
-is blocked/filtered on your network, it can route through a local **SOCKS5** proxy instead (e.g.
-one exposed by a V2ray/Xray client you run yourself).
+is blocked/filtered on your network, just paste a **VLESS proxy link** into the dashboard — the
+app parses it, downloads [xray-core](https://github.com/XTLS/Xray-core) automatically on first
+use, spins up a local tunnel, and routes Telegram traffic through it. No manual xray-core setup,
+no manual SOCKS5 configuration — it's all automatic.
+
+Only **VLESS** links are supported for now (not VMess/Trojan/Shadowsocks). xray-core is
+downloaded from [XTLS/Xray-core](https://github.com/XTLS/Xray-core)'s GitHub releases the first
+time you set a proxy link, so that first save needs outbound internet access once; after that
+it's cached under `data/bin/xray` and reused.
 
 ## Why this exists / how it's different
 
 Everything here — spawning `opencode serve` per project, creating an OpenCode session, sending
 the prompt, and reading the streamed response back off `/event` — follows the same approach as
 the Node-based [`opencode-remote-telegram`](https://github.com/weisser-dev/opencode-remote-telegram),
-just re-implemented in C# on top of the standard Telegram.Bot library, plus optional SOCKS5 proxy
-support for when Telegram is blocked directly on this network.
+just re-implemented in C# on top of the standard Telegram.Bot library, plus a built-in VLESS
+tunnel manager for when Telegram is blocked directly on this network.
 
 ## Prerequisites
 
@@ -25,10 +32,11 @@ support for when Telegram is blocked directly on this network.
    `EPERM`/binary-execution issues), run this bridge in the **same WSL environment**, not on
    Windows directly.
 3. A **bot token** from [@BotFather](https://t.me/BotFather).
-4. (Optional) If Telegram is blocked directly on this network, set up a local **V2ray/Xray**
-   client with your subscription and note the local SOCKS5 port it exposes (e.g.
-   `socks5://127.0.0.1:1080`). Setting up that client is a separate, one-time step outside this
-   app — this bridge just needs the resulting local SOCKS5 address.
+4. (Optional) If Telegram is blocked directly on this network, a **VLESS subscription link**
+   (`vless://uuid@host:port?...`) from your proxy provider. Just paste it into the dashboard —
+   everything else (downloading xray-core, generating its config, spinning up the local tunnel)
+   is handled automatically. Note: automatic xray-core download currently only supports
+   linux-x64 (i.e. WSL/Linux, which is how this app is meant to run anyway).
 
 ## Build & run
 
@@ -39,9 +47,10 @@ dotnet run
 ```
 
 The dashboard is served at **http://localhost:5080**. Open it, fill in the Settings card
-(bot token, optional SOCKS5 proxy URL, allowed Telegram user IDs, and the folder(s) containing
+(bot token, optional VLESS proxy link, allowed Telegram user IDs, and the folder(s) containing
 your projects), click **Save & reconnect**, and watch the status dot and live log at the bottom
-turn green / show "Connected as @yourbot".
+turn green / show "Connected as @yourbot". If you pasted a proxy link, the live log will also
+show xray-core being downloaded (first time only) and the local tunnel starting up.
 
 To keep it running in the background (so it survives closing the terminal), use `pm2`,
 `systemd`, or `nohup dotnet run &` — ask me if you'd like a ready-made systemd unit file.
@@ -73,6 +82,9 @@ Once connected, message your bot:
 
 Everything lives under `data/`, created next to the executable on first run:
 - `data/config.json` — your settings (also editable via the dashboard)
+- `data/bin/xray` — the downloaded xray-core binary, cached after the first proxy link save
+- `data/xray-config-<port>.json` — the generated xray-core config for the currently running
+  tunnel (deleted when the tunnel stops)
 
 ## Security notes
 
@@ -81,9 +93,10 @@ Everything lives under `data/`, created next to the executable on first run:
   arbitrary prompts (and therefore arbitrary code, indirectly) against your machine.
 - The dashboard itself has no login and binds to `0.0.0.0:5080` — fine on a trusted machine/LAN,
   but don't expose port 5080 to the open internet as-is.
-- Your bot token is stored in plain text in `data/config.json` (same as basically every
-  self-hosted bot framework). Keep that file private, and revoke/regenerate the bot token via
-  BotFather if it ever leaks.
+- Your bot token — and proxy link, if set, which embeds your VLESS UUID — are stored in plain
+  text in `data/config.json` (same as basically every self-hosted bot framework). Keep that file
+  private, and revoke/regenerate the bot token via BotFather (or rotate the VLESS UUID with your
+  proxy provider) if it ever leaks.
 
 ## v1 scope (by design) / ideas for v2
 

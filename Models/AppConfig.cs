@@ -6,11 +6,12 @@ public class AppConfig
     /// <summary>Bot token from @BotFather.</summary>
     public string BotToken { get; set; } = "";
 
-    /// <summary>Optional local SOCKS5 proxy (format: "socks5://host:port", e.g.
-    /// "socks5://127.0.0.1:1080"). Use this when api.telegram.org is blocked directly on this
-    /// network but a local V2ray/Xray client exposes a SOCKS5 listener that can reach it —
-    /// .NET's SocketsHttpHandler routes the classic HTTP Bot API traffic through it natively.</summary>
-    public string? Socks5ProxyUrl { get; set; }
+    /// <summary>Optional raw VLESS proxy link (e.g. "vless://uuid@host:port?...#name"), pasted
+    /// directly from a V2ray/Xray subscription. When set, the app parses it, downloads and
+    /// spawns a local xray-core tunnel automatically (see <see cref="ProxyTunnelManager"/>),
+    /// and routes Telegram Bot API traffic through the resulting local SOCKS5 port — no manual
+    /// xray-core setup or SOCKS5 configuration needed. Empty/null means connect directly.</summary>
+    public string? ProxyLink { get; set; }
 
     /// <summary>Telegram numeric user IDs allowed to use the bot. Empty = allow anyone (not recommended).</summary>
     public List<long> AllowedUserIds { get; set; } = new();

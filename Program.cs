@@ -10,6 +10,8 @@ builder.Logging.AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat =
 builder.Services.AddSingleton<ConfigStore>();
 builder.Services.AddSingleton<ActivityLog>();
 builder.Services.AddSingleton<OpenCodeManager>();
+builder.Services.AddSingleton<XrayBinaryProvider>();
+builder.Services.AddSingleton<ProxyTunnelManager>();
 builder.Services.AddSingleton<TelegramBridgeService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TelegramBridgeService>());
 

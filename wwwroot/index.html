@@ -76,9 +76,9 @@
         <input name="botToken" required />
       </div>
       <div class="field">
-        <label>SOCKS5 Proxy URL <span style="color:var(--muted)">(optional)</span></label>
-        <input name="socks5ProxyUrl" placeholder="socks5://127.0.0.1:1080 — leave empty to connect directly" />
-        <div class="hint">Local SOCKS5 port exposed by a V2ray/Xray client you run yourself — not a Telegram MTProxy link. Use this if Telegram is blocked directly on this network.</div>
+        <label>Proxy link (VLESS) <span style="color:var(--muted)">(optional)</span></label>
+        <textarea name="proxyLink" placeholder="vless://uuid@host:port?path=...&amp;security=tls&amp;encryption=none&amp;host=...&amp;type=ws#name — leave empty to connect directly"></textarea>
+        <div class="hint">Paste your VLESS subscription link here — it's parsed and tunneled automatically (xray-core is downloaded on first use, no manual proxy setup needed). Only VLESS is supported for now. Use this if Telegram is blocked directly on this network.</div>
       </div>
       <div class="grid">
         <div class="field">
@@ -144,7 +144,7 @@ async function loadConfig() {
   const c = await r.json();
   const f = document.getElementById('cfgForm');
   f.botToken.value = c.botToken || '';
-  f.socks5ProxyUrl.value = c.socks5ProxyUrl || '';
+  f.proxyLink.value = c.proxyLink || '';
   f.allowedUserIds.value = (c.allowedUserIds || []).join(', ');
   f.idleTimeoutMinutes.value = c.idleTimeoutMinutes || 10;
   f.projectsBasePaths.value = (c.projectsBasePaths || []).join(', ');
@@ -157,7 +157,7 @@ document.getElementById('cfgForm').addEventListener('submit', async (e) => {
   const f = e.target;
   const body = {
     botToken: f.botToken.value.trim(),
-    socks5ProxyUrl: f.socks5ProxyUrl.value.trim() || null,
+    proxyLink: f.proxyLink.value.trim() || null,
     allowedUserIds: f.allowedUserIds.value.split(',').map(s => s.trim()).filter(Boolean).map(Number),
     projectsBasePaths: f.projectsBasePaths.value.split(',').map(s => s.trim()).filter(Boolean),
     openCodeCommand: f.openCodeCommand.value.trim() || 'opencode',

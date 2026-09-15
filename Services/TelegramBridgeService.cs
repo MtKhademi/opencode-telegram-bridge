@@ -13,9 +13,12 @@ namespace OpenCodeTelegramBridge.Services;
 /// <summary>
 /// Connects to Telegram over the classic HTTP Bot API (via the Telegram.Bot NuGet package)
 /// using just a bot token — no api_id/api_hash from my.telegram.org required. When
-/// api.telegram.org is blocked directly on this network, route through a local SOCKS5 proxy
-/// (e.g. exposed by a V2ray/Xray client) via <see cref="AppConfig.Socks5ProxyUrl"/> — .NET's
-/// SocketsHttpHandler supports socks5:// proxies natively.
+/// api.telegram.org is blocked directly on this network, the user pastes a raw VLESS proxy
+/// link (<see cref="AppConfig.ProxyLink"/>) into the dashboard; this service parses it via
+/// <see cref="VlessUriParser"/>, spins up a local xray-core tunnel via
+/// <see cref="ProxyTunnelManager"/>, and routes Bot API traffic through the resulting local
+/// SOCKS5 port — .NET's SocketsHttpHandler supports socks5:// proxies natively. No manual
+/// xray-core setup or SOCKS5 configuration is needed.
 ///
 /// Bridges Telegram chats to per-project `opencode serve` instances managed by <see cref="OpenCodeManager"/>.
 /// </summary>
@@ -25,6 +28,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
 
     private readonly ConfigStore _configStore;
     private readonly OpenCodeManager _openCode;
+    private readonly ProxyTunnelManager _proxyTunnel;
     private readonly ActivityLog _log;
     private readonly ConcurrentDictionary<long, ChatState> _chatStates = new();
     private readonly ConcurrentDictionary<long, CancellationTokenSource> _inFlight = new();
@@ -38,10 +42,11 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     public long BotId { get; private set; }
     public string? LastError { get; private set; }
 
-    public TelegramBridgeService(ConfigStore configStore, OpenCodeManager openCode, ActivityLog log)
+    public TelegramBridgeService(ConfigStore configStore, OpenCodeManager openCode, ProxyTunnelManager proxyTunnel, ActivityLog log)
     {
         _configStore = configStore;
         _openCode = openCode;
+        _proxyTunnel = proxyTunnel;
         _log = log;
     }
 
@@ -67,19 +72,43 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
 
         try
         {
-            if (!string.IsNullOrWhiteSpace(config.Socks5ProxyUrl))
+            if (!string.IsNullOrWhiteSpace(config.ProxyLink))
             {
+                VlessConfig vless;
+                try
+                {
+                    vless = VlessUriParser.Parse(config.ProxyLink);
+                }
+                catch (Exception ex)
+                {
+                    _log.Error($"Invalid proxy link: {ex.Message}");
+                    throw new InvalidOperationException($"Invalid proxy link: {ex.Message}", ex);
+                }
+
+                string socks5Url;
+                try
+                {
+                    socks5Url = await _proxyTunnel.StartAsync(vless);
+                }
+                catch (Exception ex)
+                {
+                    _log.Error($"Failed to start proxy tunnel: {ex.Message}");
+                    throw new InvalidOperationException($"Failed to start proxy tunnel: {ex.Message}", ex);
+                }
+
                 var handler = new SocketsHttpHandler
                 {
-                    Proxy = new System.Net.WebProxy(new Uri(config.Socks5ProxyUrl)),
+                    Proxy = new System.Net.WebProxy(new Uri(socks5Url)),
                     UseProxy = true,
                 };
                 _httpClient = new HttpClient(handler);
                 _client = new TelegramBotClient(config.BotToken, _httpClient);
-                _log.Info("Connecting to Telegram via SOCKS5 proxy…");
+                _log.Info($"Connecting to Telegram via local tunnel ({socks5Url})…");
             }
             else
             {
+                // No proxy link configured — DisconnectAsync() above already stopped any
+                // previous tunnel, so just connect directly.
                 _client = new TelegramBotClient(config.BotToken);
                 _log.Info("Connecting to Telegram directly…");
             }
@@ -122,6 +151,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             _httpClient.Dispose();
             _httpClient = null;
         }
+        await _proxyTunnel.StopAsync();
     }
 
     // ───────────────────────── Update handling ─────────────────────────
