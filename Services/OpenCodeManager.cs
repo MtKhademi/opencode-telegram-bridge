@@ -72,7 +72,7 @@ public class OpenCodeManager : IDisposable
             FileName = config.OpenCodeCommand,
             Arguments = "models",
             RedirectStandardOutput = true,
-            RedirectStandardError = true,
+            RedirectStandardError = false,
             UseShellExecute = false,
         };
         ApplyEnv(psi, config);
@@ -113,8 +113,8 @@ public class OpenCodeManager : IDisposable
             FileName = config.OpenCodeCommand,
             Arguments = $"serve --port {port} --hostname 127.0.0.1",
             WorkingDirectory = projectPath,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
+            RedirectStandardOutput = false,
+            RedirectStandardError = false,
             UseShellExecute = false,
         };
         ApplyEnv(psi, config);
@@ -145,8 +145,6 @@ public class OpenCodeManager : IDisposable
         };
         _sessions[projectPath] = session;
 
-        _ = PumpOutputAsync(process.StandardOutput, port, isError: false);
-        _ = PumpOutputAsync(process.StandardError, port, isError: true);
         process.EnableRaisingEvents = true;
         process.Exited += (_, _) =>
         {
@@ -164,21 +162,6 @@ public class OpenCodeManager : IDisposable
 
         await WaitForReadyAsync(session, ct);
         return session;
-    }
-
-    private async Task PumpOutputAsync(StreamReader reader, int port, bool isError)
-    {
-        try
-        {
-            string? line;
-            while ((line = await reader.ReadLineAsync()) != null)
-            {
-                if (line.Length == 0) continue;
-                if (isError) _log.Warn($"[serve:{port}] {line}");
-                else _log.Info($"[serve:{port}] {line}");
-            }
-        }
-        catch { /* process ended, stream closed — ignore */ }
     }
 
     private async Task WaitForReadyAsync(ProjectSession session, CancellationToken ct)

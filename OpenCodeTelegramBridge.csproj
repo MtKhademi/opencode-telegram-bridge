@@ -18,6 +18,9 @@
   <ItemGroup>
     <Content Remove="data/**" />
     <None Remove="data/**" />
+    <Compile Remove="tests/**" />
+    <Content Remove="tests/**" />
+    <None Remove="tests/**" />
   </ItemGroup>
 
 </Project>

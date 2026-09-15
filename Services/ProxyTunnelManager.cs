@@ -6,8 +6,8 @@ namespace OpenCodeTelegramBridge.Services;
 /// <summary>
 /// Spawns and manages a local xray-core process that tunnels a VLESS proxy link into a plain
 /// local SOCKS5 listener, mirroring the process-management pattern used by
-/// <see cref="OpenCodeManager"/> for `opencode serve` (fresh free port, redirect stdout/stderr
-/// into <see cref="ActivityLog"/>, EnableRaisingEvents, track Exited).
+/// <see cref="OpenCodeManager"/> for `opencode serve` (fresh free port, inherited stdout/stderr,
+/// EnableRaisingEvents, track Exited).
 ///
 /// Usage: call <see cref="StartAsync"/> with a parsed <see cref="VlessConfig"/> to (re)start the
 /// tunnel; it returns a "socks5://127.0.0.1:&lt;port&gt;" URL once the tunnel is confirmed
@@ -52,8 +52,8 @@ public class ProxyTunnelManager : IDisposable
         {
             FileName = binaryPath,
             Arguments = $"run -c \"{configPath}\"",
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
+            RedirectStandardOutput = false,
+            RedirectStandardError = false,
             UseShellExecute = false,
         };
 
@@ -74,8 +74,6 @@ public class ProxyTunnelManager : IDisposable
         _configPath = configPath;
         LocalPort = port;
 
-        _ = PumpOutputAsync(process.StandardOutput, port, isError: false);
-        _ = PumpOutputAsync(process.StandardError, port, isError: true);
         process.EnableRaisingEvents = true;
         process.Exited += (_, _) =>
         {
@@ -98,21 +96,6 @@ public class ProxyTunnelManager : IDisposable
 
         _log.Info($"[xray:{port}] tunnel ready");
         return $"socks5://127.0.0.1:{port}";
-    }
-
-    private async Task PumpOutputAsync(StreamReader reader, int port, bool isError)
-    {
-        try
-        {
-            string? line;
-            while ((line = await reader.ReadLineAsync()) != null)
-            {
-                if (line.Length == 0) continue;
-                if (isError) _log.Warn($"[xray:{port}] {line}");
-                else _log.Info($"[xray:{port}] {line}");
-            }
-        }
-        catch { /* process ended, stream closed — ignore */ }
     }
 
     public async Task StopAsync()

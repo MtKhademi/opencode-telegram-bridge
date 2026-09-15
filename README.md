@@ -175,20 +175,38 @@ session (e.g. right after turning on your PC), have Windows launch WSL automatic
 
 Once connected, message your bot:
 
-- `/projects` — list every subfolder of your configured project folder(s)
-- `/use <name>` — select a project for this chat
-- `/models` — list models available via `opencode models`
-- `/model <provider/model>` — select a model (optional — omit to use OpenCode's default)
+- `/start` or `/menu` — open the Persian button-based main menu without changing your current
+  project/model selection
+- `/projects` — show discovered projects as selectable buttons
+- `/use <name>` — select a project for this chat (if multiple projects share the same name, the
+  bot shows matching buttons instead of guessing)
+- `/models` — show model providers/models as buttons using the live `opencode models` output
+- `/model <provider/model>` — select a model by text
+- `/model default` — reset back to OpenCode's default model
 - `/status` — show your current project/model and whether its server is running
 - `/stop` — stop the `opencode serve` instance for your selected project
-- `/abort` — cancel an in-progress prompt
+- `/abort` — cancel the bridge's in-progress request and best-effort call OpenCode's abort
+  endpoint when the OpenCode session id is known
 - anything else you type is sent straight to OpenCode as a prompt; you'll get a "🤔 Thinking…"
   placeholder followed by the final response (long responses are split into multiple messages).
+  The last response message includes a **🏠 منوی اصلی** button.
+
+The menu UI is Persian for user-facing labels/messages, while project names, model identifiers,
+and text commands stay unchanged. Project selection does not start an OpenCode server; the server
+still starts lazily on the first prompt for that project.
+
+Menu buttons use short-lived server-side snapshots so Telegram callback data stays under the
+64-byte Bot API limit and never embeds full project paths or long model IDs. Old buttons can expire
+(after about 15 minutes) or become invalid after an app restart/configuration change; if that
+happens, open `/menu` or refresh the relevant list. Changing project/model while a prompt is
+running affects the next prompt only; the running prompt keeps the project/model snapshot it started
+with.
 
 If a project's `opencode.json` gates a tool behind `"ask"` permission (e.g. `bash`, `edit`),
-OpenCode will pause and wait for approval. You'll get a Telegram message describing the
-action/resources with three inline buttons — **✅ Once**, **🔁 Always**, **❌ Reject** — tap one
-and the decision is relayed back to OpenCode so it can continue (or stop) accordingly.
+OpenCode will pause and wait for approval. You'll get a separate Telegram permission message
+describing the action/resources with three inline buttons — **✅ Once**, **🔁 Always**, **❌ Reject**
+— tap one and the decision is relayed back to OpenCode so it can continue (or stop) accordingly.
+Permission messages are never replaced by menu navigation.
 
 ## Where things are stored
 

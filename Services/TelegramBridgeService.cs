@@ -7,35 +7,30 @@ using Telegram.Bot.Exceptions;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
 
 namespace OpenCodeTelegramBridge.Services;
 
 /// <summary>
 /// Connects to Telegram over the classic HTTP Bot API (via the Telegram.Bot NuGet package)
-/// using just a bot token — no api_id/api_hash from my.telegram.org required. When
-/// api.telegram.org is blocked directly on this network, the user pastes a raw VLESS proxy
-/// link (<see cref="AppConfig.ProxyLink"/>) into the dashboard; this service parses it via
-/// <see cref="VlessUriParser"/>, spins up a local xray-core tunnel via
-/// <see cref="ProxyTunnelManager"/>, and routes Bot API traffic through the resulting local
-/// SOCKS5 port — .NET's SocketsHttpHandler supports socks5:// proxies natively. No manual
-/// xray-core setup or SOCKS5 configuration is needed.
-///
-/// Bridges Telegram chats to per-project `opencode serve` instances managed by <see cref="OpenCodeManager"/>.
+/// using just a bot token. Bridges Telegram chats to per-project `opencode serve` instances.
 /// </summary>
 public class TelegramBridgeService : IHostedService, IAsyncDisposable
 {
     private const int TelegramMessageLimit = 4000;
+    private const int PageSize = TelegramMenuLogic.PageSize;
+    private static readonly TimeSpan SnapshotTtl = TimeSpan.FromMinutes(15);
 
     private readonly ConfigStore _configStore;
     private readonly OpenCodeManager _openCode;
     private readonly ProxyTunnelManager _proxyTunnel;
     private readonly ActivityLog _log;
     private readonly ConcurrentDictionary<long, ChatState> _chatStates = new();
-    private readonly ConcurrentDictionary<long, CancellationTokenSource> _inFlight = new();
+    private readonly ConcurrentDictionary<long, PromptExecution> _inFlight = new();
+    private readonly ConcurrentDictionary<long, SemaphoreSlim> _chatLocks = new();
+    private readonly ConcurrentDictionary<string, MenuSnapshot> _snapshots = new(StringComparer.Ordinal);
 
-    /// <summary>Permission requests currently awaiting a Telegram reply, keyed by OpenCode's
-    /// request id ("per_..."). Process-memory only, matching this project's existing pattern for
-    /// chat state — an app restart or unanswered request just drops silently, no persistence.</summary>
+    /// <summary>Permission requests currently awaiting a Telegram reply, keyed by OpenCode's request id.</summary>
     private readonly ConcurrentDictionary<string, PendingPermission> _pendingPermissions = new();
 
     private TelegramBotClient? _client;
@@ -63,8 +58,6 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
 
     public async Task StopAsync(CancellationToken cancellationToken) => await DisconnectAsync();
 
-    /// <summary>(Re)connects using the given config. Safe to call again after saving new settings
-    /// from the dashboard — the previous connection (if any) is torn down first.</summary>
     public async Task ApplyConfigAsync(AppConfig config)
     {
         await DisconnectAsync();
@@ -90,17 +83,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
                     throw new InvalidOperationException($"Invalid proxy link: {ex.Message}", ex);
                 }
 
-                string socks5Url;
-                try
-                {
-                    socks5Url = await _proxyTunnel.StartAsync(vless);
-                }
-                catch (Exception ex)
-                {
-                    _log.Error($"Failed to start proxy tunnel: {ex.Message}");
-                    throw new InvalidOperationException($"Failed to start proxy tunnel: {ex.Message}", ex);
-                }
-
+                var socks5Url = await _proxyTunnel.StartAsync(vless);
                 var handler = new SocketsHttpHandler
                 {
                     Proxy = new System.Net.WebProxy(new Uri(socks5Url)),
@@ -112,8 +95,6 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             }
             else
             {
-                // No proxy link configured — DisconnectAsync() above already stopped any
-                // previous tunnel, so just connect directly.
                 _client = new TelegramBotClient(config.BotToken);
                 _log.Info("Connecting to Telegram directly…");
             }
@@ -146,24 +127,18 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         IsConnected = false;
         if (_receiveCts != null)
         {
-            try { await _receiveCts.CancelAsync(); } catch { /* ignore */ }
+            try { await _receiveCts.CancelAsync(); } catch { }
             _receiveCts.Dispose();
             _receiveCts = null;
         }
         _client = null;
-        if (_httpClient != null)
-        {
-            _httpClient.Dispose();
-            _httpClient = null;
-        }
+        _httpClient?.Dispose();
+        _httpClient = null;
         await _proxyTunnel.StopAsync();
     }
 
-    // ───────────────────────── Update handling ─────────────────────────
-
     private Task OnUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
-        // fire-and-forget so a slow prompt doesn't block the update pump
         if (update.Message is { } m)
             _ = Task.Run(() => HandleMessageAsync(m));
         else if (update.CallbackQuery is { } cq)
@@ -185,13 +160,11 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     {
         try
         {
-            if (m.Chat.Type != ChatType.Private) return; // v1: private chats with the bot only
+            if (m.Chat.Type != ChatType.Private) return;
             var chatId = m.Chat.Id;
-            var config = _configStore.Current;
-
-            if (config.AllowedUserIds.Count > 0 && !config.AllowedUserIds.Contains(chatId))
+            if (!IsAllowed(chatId))
             {
-                await SendAsync(chatId, "⛔ You're not authorized to use this bot.");
+                await SendAsync(chatId, "⛔ شما اجازه استفاده از این ربات را ندارید.");
                 _log.Warn($"Rejected message from unauthorized user {chatId}");
                 return;
             }
@@ -199,10 +172,8 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             var text = m.Text?.Trim();
             if (string.IsNullOrEmpty(text)) return;
 
-            if (text.StartsWith('/'))
-                await HandleCommandAsync(chatId, text);
-            else
-                await RunPromptAsync(chatId, text);
+            if (text.StartsWith('/')) await HandleCommandAsync(chatId, m.From?.Id ?? chatId, text);
+            else await RunPromptAsync(chatId, text);
         }
         catch (Exception ex)
         {
@@ -210,171 +181,371 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         }
     }
 
-    private ChatState GetState(long chatId) => _chatStates.GetOrAdd(chatId, _ => new ChatState());
+    private bool IsAllowed(long userId)
+    {
+        var allowed = _configStore.Current.AllowedUserIds;
+        return allowed.Count == 0 || allowed.Contains(userId);
+    }
 
-    private async Task HandleCommandAsync(long chatId, string text)
+    private ChatState GetState(long chatId) => _chatStates.GetOrAdd(chatId, _ => new ChatState());
+    private SemaphoreSlim GetChatLock(long chatId) => _chatLocks.GetOrAdd(chatId, _ => new SemaphoreSlim(1, 1));
+
+    private async Task HandleCommandAsync(long chatId, long userId, string text)
     {
         var parts = text.Split(' ', 2, StringSplitOptions.TrimEntries);
         var cmd = parts[0].ToLowerInvariant();
         var arg = parts.Length > 1 ? parts[1] : "";
-        var state = GetState(chatId);
 
         switch (cmd)
         {
             case "/start":
-                await SendAsync(chatId,
-                    "👋 Hi! I bridge Telegram to your OpenCode projects.\n\n" +
-                    "/projects — list projects\n" +
-                    "/use <name> — select a project\n" +
-                    "/models — list available models\n" +
-                    "/model <name> — select a model\n" +
-                    "/status — show current selection\n" +
-                    "/stop — stop the running OpenCode server for this project\n" +
-                    "/abort — cancel the in-progress prompt\n\n" +
-                    "Then just send me a message to run it as a prompt.");
+            case "/menu":
+                await ShowMainMenuAsync(chatId, userId);
                 break;
-
             case "/help":
-                await SendAsync(chatId,
-                    "/projects, /use <name>, /models, /model <name>, /status, /stop, /abort, /help");
+                await SendAsync(chatId, HelpText(), MainMenuOnlyKeyboard());
                 break;
-
             case "/projects":
-            {
-                var projects = _openCode.DiscoverProjects();
-                if (projects.Count == 0)
-                {
-                    await SendAsync(chatId, "No projects found. Check the projects folder(s) in the dashboard.");
-                    break;
-                }
-                var list = string.Join('\n', projects.Select(p => $"• {p.Name}"));
-                await SendAsync(chatId, $"📁 Projects:\n{list}\n\nUse /use <name> to select one.");
+                await ShowProjectsAsync(chatId, userId);
                 break;
-            }
-
             case "/use":
-            {
-                if (string.IsNullOrWhiteSpace(arg)) { await SendAsync(chatId, "Usage: /use <project name>"); break; }
-                var match = _openCode.DiscoverProjects()
-                    .FirstOrDefault(p => string.Equals(p.Name, arg, StringComparison.OrdinalIgnoreCase));
-                if (match == default)
-                {
-                    await SendAsync(chatId, $"Project '{arg}' not found. Use /projects to see the list.");
-                    break;
-                }
-                state.ProjectPath = match.Path;
-                await SendAsync(chatId, $"✅ Project set to '{match.Name}'.");
+                await UseProjectByNameAsync(chatId, userId, arg);
                 break;
-            }
-
             case "/models":
-            {
-                await SendAsync(chatId, "⏳ Fetching models…");
-                try
-                {
-                    var models = await _openCode.GetModelsAsync();
-                    await SendAsync(chatId, models.Count == 0
-                        ? "No models found."
-                        : $"🧠 Models:\n{string.Join('\n', models.Select(m => $"• {m}"))}\n\nUse /model <name> to select one.");
-                }
-                catch (Exception ex)
-                {
-                    await SendAsync(chatId, $"Failed to list models: {ex.Message}");
-                }
+                await ShowModelProvidersAsync(chatId, userId, refresh: true);
                 break;
-            }
-
             case "/model":
-                if (string.IsNullOrWhiteSpace(arg)) { await SendAsync(chatId, "Usage: /model <provider/model>"); break; }
-                state.Model = arg;
-                await SendAsync(chatId, $"✅ Model set to '{arg}'.");
+                await SelectModelByTextAsync(chatId, userId, arg);
                 break;
-
             case "/status":
-            {
-                var running = state.ProjectPath != null &&
-                               _openCode.ActiveSessions.Any(s => s.ProjectPath == state.ProjectPath && !s.Exited);
-                await SendAsync(chatId,
-                    $"Project: {(state.ProjectPath is { } p ? Path.GetFileName(p) : "none")}\n" +
-                    $"Model: {state.Model ?? "default"}\n" +
-                    $"Server running: {(running ? "yes" : "no")}");
+                await ShowStatusAsync(chatId, userId);
                 break;
-            }
-
             case "/stop":
-                if (state.ProjectPath != null) await _openCode.StopAsync(state.ProjectPath);
-                await SendAsync(chatId, "🛑 Stopped.");
+                await StopProjectServerAsync(chatId, userId);
                 break;
-
             case "/abort":
-                if (_inFlight.TryRemove(chatId, out var cts)) { cts.Cancel(); await SendAsync(chatId, "Aborted."); }
-                else await SendAsync(chatId, "Nothing is running.");
+                await AbortPromptAsync(chatId, userId);
                 break;
-
             default:
-                await SendAsync(chatId, $"Unknown command '{cmd}'. Try /help.");
+                await SendAsync(chatId, $"دستور ناشناخته است: {cmd}\nبرای دیدن گزینه‌ها /menu را بفرستید.", MainMenuOnlyKeyboard());
                 break;
         }
     }
 
-    // ───────────────────────── Prompt execution ─────────────────────────
-
-    private async Task RunPromptAsync(long chatId, string text)
+    private async Task ShowMainMenuAsync(long chatId, long userId, int? messageId = null, string? prefix = null)
     {
+        CleanupSnapshots();
         var state = GetState(chatId);
-        if (state.ProjectPath == null)
+        var projectName = GetSelectedProjectName(state.ProjectPath) ?? "انتخاب نشده";
+        var model = state.Model ?? "پیش‌فرض OpenCode";
+        var running = state.ProjectPath != null && IsProjectRunning(state.ProjectPath);
+        var text =
+            (string.IsNullOrWhiteSpace(prefix) ? "" : prefix.TrimEnd() + "\n\n") +
+            "منوی OpenCode Telegram Bridge\n\n" +
+            $"پروژه: {projectName}\n" +
+            $"مدل: {model}\n" +
+            $"سرور پروژه: {(running ? "در حال اجرا" : "متوقف")}";
+
+        var keyboard = new InlineKeyboardMarkup(new[]
         {
-            await SendAsync(chatId, "⚠️ No project selected. Use /projects then /use <name> first.");
+            new[] { InlineKeyboardButton.WithCallbackData("📁 پروژه‌ها", "menu:projects"), InlineKeyboardButton.WithCallbackData("🧠 تغییر مدل", "menu:models") },
+            new[] { InlineKeyboardButton.WithCallbackData("📊 وضعیت", "menu:status"), InlineKeyboardButton.WithCallbackData("⏹ لغو درخواست", "menu:abort") },
+            new[] { InlineKeyboardButton.WithCallbackData("🛑 توقف سرور پروژه", "menu:stop") },
+            new[] { InlineKeyboardButton.WithCallbackData("❓ راهنما", "menu:help") },
+        });
+        await SendOrEditMenuAsync(chatId, messageId, text, keyboard);
+    }
+
+    private async Task ShowProjectsAsync(long chatId, long userId, int? messageId = null, int page = 0, string? prefix = null)
+    {
+        CleanupSnapshots();
+        var projects = _openCode.DiscoverProjects();
+        if (projects.Count == 0)
+        {
+            await SendOrEditMenuAsync(chatId, messageId,
+                (prefix is null ? "" : prefix + "\n\n") + "هیچ پروژه‌ای پیدا نشد. مسیر پروژه‌ها را در داشبورد بررسی کنید.",
+                new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") } }));
             return;
         }
 
-        // Cancel any previous in-flight prompt for this chat (mirrors the upstream tool's behaviour).
-        if (_inFlight.TryRemove(chatId, out var previous)) previous.Cancel();
-        var cts = new CancellationTokenSource();
-        _inFlight[chatId] = cts;
-        var ct = cts.Token;
+        page = Math.Clamp(page, 0, Math.Max(0, (projects.Count - 1) / PageSize));
+        var labels = BuildProjectLabels(projects);
+        var snapshot = CreateSnapshot(chatId, userId, messageId ?? 0);
+        var rows = new List<InlineKeyboardButton[]>();
+        var state = GetState(chatId);
+        foreach (var (project, label) in projects.Zip(labels).Skip(page * PageSize).Take(PageSize))
+        {
+            var token = AddToken(snapshot, MenuItemKind.Project, project.Path);
+            var selected = state.ProjectPath == project.Path ? "✅ " : "";
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData(selected + label, $"project:select:{snapshot.Id}:{token}") });
+        }
+        AddPager(rows, "project:page", snapshot.Id, page, projects.Count);
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") });
+
+        var text = (prefix is null ? "" : prefix + "\n\n") + "📁 پروژه را انتخاب کنید:";
+        var sentId = await SendOrEditMenuAsync(chatId, messageId, text, new InlineKeyboardMarkup(rows));
+        snapshot.MessageId = (int)(sentId ?? messageId ?? 0);
+    }
+
+    private async Task UseProjectByNameAsync(long chatId, long userId, string arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+        {
+            await SendAsync(chatId, "روش استفاده: /use <name>", MainMenuOnlyKeyboard());
+            return;
+        }
+        var projects = _openCode.DiscoverProjects();
+        var matches = projects.Where(p => string.Equals(p.Name, arg, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (matches.Count == 0)
+        {
+            await SendAsync(chatId, $"پروژه‌ای با نام '{arg}' پیدا نشد.", ProjectsOnlyKeyboard());
+            return;
+        }
+        if (matches.Count > 1)
+        {
+            var labels = BuildProjectLabels(matches);
+            var snapshot = CreateSnapshot(chatId, userId, 0);
+            var rows = matches.Zip(labels).Select(pair =>
+            {
+                var token = AddToken(snapshot, MenuItemKind.Project, pair.First.Path);
+                return new[] { InlineKeyboardButton.WithCallbackData(pair.Second, $"project:select:{snapshot.Id}:{token}") };
+            }).ToList();
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") });
+            var id = await SendAsync(chatId, "چند پروژه با این نام پیدا شد. یکی را انتخاب کنید:", new InlineKeyboardMarkup(rows));
+            snapshot.MessageId = (int)(id ?? 0);
+            return;
+        }
+        await SelectProjectPathAsync(chatId, userId, matches[0].Path);
+    }
+
+    private async Task SelectProjectPathAsync(long chatId, long userId, string projectPath, int? messageId = null)
+    {
+        var projects = _openCode.DiscoverProjects();
+        var match = projects.FirstOrDefault(p => p.Path == projectPath);
+        if (match == default)
+        {
+            await ShowProjectsAsync(chatId, userId, messageId, prefix: "این پروژه دیگر در فهرست فعلی وجود ندارد.");
+            return;
+        }
+        var gate = GetChatLock(chatId);
+        await gate.WaitAsync();
+        try { GetState(chatId).ProjectPath = match.Path; }
+        finally { gate.Release(); }
+        await ShowMainMenuAsync(chatId, userId, messageId, $"✅ پروژه '{match.Name}' انتخاب شد.");
+    }
+
+    private async Task ShowModelProvidersAsync(long chatId, long userId, int? messageId = null, bool refresh = false, string? prefix = null)
+    {
+        var loadingId = messageId;
+        if (refresh || messageId == null)
+            loadingId = (int?)await SendOrEditMenuAsync(chatId, messageId, "⏳ در حال دریافت فهرست مدل‌ها…", MainMenuOnlyKeyboard());
+        try
+        {
+            var models = await _openCode.GetModelsAsync();
+            await ShowModelProvidersFromListAsync(chatId, userId, loadingId, models, prefix);
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"[models] failed: {ex.Message}");
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("🔄 تلاش دوباره", "model:refresh") },
+                new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") },
+            });
+            await SendOrEditMenuAsync(chatId, loadingId, $"دریافت مدل‌ها ناموفق بود:\n{ex.Message}", keyboard);
+        }
+    }
+
+    private async Task ShowModelProvidersFromListAsync(long chatId, long userId, int? messageId, List<string> models, string? prefix = null)
+    {
+        CleanupSnapshots();
+        var snapshot = CreateSnapshot(chatId, userId, messageId ?? 0);
+        var rows = new List<InlineKeyboardButton[]>
+        {
+            new[] { InlineKeyboardButton.WithCallbackData(GetState(chatId).Model == null ? "✅ پیش‌فرض OpenCode" : "پیش‌فرض OpenCode", $"model:default:{snapshot.Id}") }
+        };
+
+        var providers = models.Select(m => OpenCodeManager.ParseModel(m)?.providerId)
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(p => p)
+            .ToList();
+
+        if (models.Count == 0)
+        {
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔄 تازه‌سازی", "model:refresh") });
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") });
+            await SendOrEditMenuAsync(chatId, messageId, "مدلی پیدا نشد.", new InlineKeyboardMarkup(rows));
+            return;
+        }
+
+        foreach (var provider in providers.Take(PageSize))
+        {
+            var token = AddToken(snapshot, MenuItemKind.Provider, provider!);
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData(provider!, $"model:provider:{snapshot.Id}:{token}") });
+        }
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔄 تازه‌سازی", "model:refresh") });
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") });
+        var text = (prefix is null ? "" : prefix + "\n\n") + "🧠 ارائه‌دهنده مدل را انتخاب کنید:";
+        var sentId = await SendOrEditMenuAsync(chatId, messageId, text, new InlineKeyboardMarkup(rows));
+        snapshot.MessageId = (int)(sentId ?? messageId ?? 0);
+    }
+
+    private async Task ShowModelsForProviderAsync(long chatId, long userId, string provider, int? messageId, int page = 0)
+    {
+        try
+        {
+            var models = await _openCode.GetModelsAsync();
+            var providerModels = models.Where(m => OpenCodeManager.ParseModel(m)?.providerId.Equals(provider, StringComparison.OrdinalIgnoreCase) == true).ToList();
+            if (providerModels.Count == 0)
+            {
+                await ShowModelProvidersAsync(chatId, userId, messageId, refresh: true, prefix: "برای این ارائه‌دهنده مدلی پیدا نشد.");
+                return;
+            }
+            page = Math.Clamp(page, 0, Math.Max(0, (providerModels.Count - 1) / PageSize));
+            var snapshot = CreateSnapshot(chatId, userId, messageId ?? 0);
+            var rows = new List<InlineKeyboardButton[]>();
+            foreach (var model in providerModels.Skip(page * PageSize).Take(PageSize))
+            {
+                var token = AddToken(snapshot, MenuItemKind.Model, model);
+                var label = GetState(chatId).Model == model ? "✅ " + model : model;
+                rows.Add(new[] { InlineKeyboardButton.WithCallbackData(label, $"model:select:{snapshot.Id}:{token}") });
+            }
+            var providerPageToken = AddToken(snapshot, MenuItemKind.Provider, provider);
+            AddPager(rows, "model:page", snapshot.Id, page, providerModels.Count, providerPageToken);
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⬅️ بازگشت", "model:refresh"), InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") });
+            var sentId = await SendOrEditMenuAsync(chatId, messageId, $"مدل‌های {provider}:", new InlineKeyboardMarkup(rows));
+            snapshot.MessageId = (int)(sentId ?? messageId ?? 0);
+        }
+        catch (Exception ex)
+        {
+            await SendOrEditMenuAsync(chatId, messageId, $"دریافت مدل‌ها ناموفق بود:\n{ex.Message}", new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("🔄 تلاش دوباره", "model:refresh") } }));
+        }
+    }
+
+    private async Task SelectModelByTextAsync(long chatId, long userId, string arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+        {
+            await SendAsync(chatId, "روش استفاده: /model <provider/model> یا /model default", MainMenuOnlyKeyboard());
+            return;
+        }
+        if (string.Equals(arg, "default", StringComparison.OrdinalIgnoreCase))
+        {
+            await SetModelAsync(chatId, userId, null);
+            return;
+        }
+        await SendAsync(chatId, "⏳ در حال بررسی مدل…");
+        var models = await _openCode.GetModelsAsync();
+        var match = models.FirstOrDefault(m => string.Equals(m, arg, StringComparison.OrdinalIgnoreCase));
+        if (match == null)
+        {
+            await SendAsync(chatId, "این مدل در فهرست OpenCode پیدا نشد. از /models استفاده کنید.", ChangeModelOnlyKeyboard());
+            return;
+        }
+        await SetModelAsync(chatId, userId, match);
+    }
+
+    private async Task SetModelAsync(long chatId, long userId, string? model, int? messageId = null)
+    {
+        var gate = GetChatLock(chatId);
+        await gate.WaitAsync();
+        try { GetState(chatId).Model = model; }
+        finally { gate.Release(); }
+        await ShowMainMenuAsync(chatId, userId, messageId, model == null ? "✅ مدل به پیش‌فرض OpenCode برگشت." : $"✅ مدل '{model}' انتخاب شد.");
+    }
+
+    private async Task ShowStatusAsync(long chatId, long userId, int? messageId = null)
+    {
+        var state = GetState(chatId);
+        var text =
+            $"📊 وضعیت\n\nپروژه: {GetSelectedProjectName(state.ProjectPath) ?? "انتخاب نشده"}\n" +
+            $"مدل: {state.Model ?? "پیش‌فرض OpenCode"}\n" +
+            $"سرور پروژه: {(state.ProjectPath != null && IsProjectRunning(state.ProjectPath) ? "در حال اجرا" : "متوقف")}";
+        await SendOrEditMenuAsync(chatId, messageId, text, MainMenuOnlyKeyboard());
+    }
+
+    private async Task StopProjectServerAsync(long chatId, long userId, int? messageId = null)
+    {
+        var projectPath = GetState(chatId).ProjectPath;
+        if (projectPath != null) await _openCode.StopAsync(projectPath);
+        await ShowMainMenuAsync(chatId, userId, messageId, projectPath == null ? "پروژه‌ای انتخاب نشده است." : "🛑 سرور پروژه متوقف شد.");
+    }
+
+    private async Task AbortPromptAsync(long chatId, long userId, int? messageId = null)
+    {
+        if (!_inFlight.TryRemove(chatId, out var execution))
+        {
+            await ShowMainMenuAsync(chatId, userId, messageId, "درخواستی در حال اجرا نیست.");
+            return;
+        }
+        if (execution.ProjectPath != null && execution.OpenCodeSessionId != null)
+        {
+            var session = _openCode.ActiveSessions.FirstOrDefault(s => s.ProjectPath == execution.ProjectPath && !s.Exited);
+            if (session != null) await _openCode.AbortAsync(session, execution.OpenCodeSessionId);
+        }
+        execution.Cancellation.Cancel();
+        await ShowMainMenuAsync(chatId, userId, messageId, "⏹ درخواست لغو شد.");
+    }
+
+    private async Task RunPromptAsync(long chatId, string text)
+    {
+        string? projectPath;
+        string? model;
+        var gate = GetChatLock(chatId);
+        await gate.WaitAsync();
+        try
+        {
+            var state = GetState(chatId);
+            projectPath = state.ProjectPath;
+            model = state.Model;
+        }
+        finally { gate.Release(); }
+
+        if (projectPath == null)
+        {
+            await SendAsync(chatId, "برای ارسال درخواست ابتدا یک پروژه انتخاب کنید.", ProjectsOnlyKeyboard());
+            return;
+        }
+
+        if (_inFlight.TryRemove(chatId, out var previous)) previous.Cancellation.Cancel();
+        var execution = new PromptExecution { Cancellation = new CancellationTokenSource(), ProjectPath = projectPath };
+        _inFlight[chatId] = execution;
+        var ct = execution.Cancellation.Token;
 
         long? placeholderId = null;
         try
         {
-            var wasRunning = _openCode.ActiveSessions.Any(s => s.ProjectPath == state.ProjectPath && !s.Exited);
-            if (!wasRunning)
-                placeholderId = await SendAsync(chatId, "⏳ Starting OpenCode server…");
+            var wasRunning = IsProjectRunning(projectPath);
+            if (!wasRunning) placeholderId = await SendAsync(chatId, "⏳ در حال راه‌اندازی سرور OpenCode…");
 
-            var session = await _openCode.GetOrStartAsync(state.ProjectPath, ct);
+            var session = await _openCode.GetOrStartAsync(projectPath, ct);
             var openCodeSessionId = await _openCode.CreateOpenCodeSessionAsync(session, ct);
+            execution.OpenCodeSessionId = openCodeSessionId;
 
             var accumulated = new StringBuilder();
             var thinkingStarted = false;
-            var lastThinkingEdit = DateTimeOffset.MinValue;
 
-            // Kick off the prompt, then read the response back off the /event stream.
-            await _openCode.SendPromptAsync(session, openCodeSessionId, text, state.Model, ct);
+            await _openCode.SendPromptAsync(session, openCodeSessionId, text, model, ct);
 
             await foreach (var evt in _openCode.ListenEventsAsync(session, ct))
             {
                 switch (evt.Type)
                 {
                     case "session.status":
-                        if (!thinkingStarted &&
-                            evt.Properties.TryGetProperty("status", out var st) &&
-                            st.TryGetProperty("type", out var stType) &&
-                            stType.GetString() == "busy")
+                        if (!thinkingStarted && evt.Properties.TryGetProperty("status", out var st) && st.TryGetProperty("type", out var stType) && stType.GetString() == "busy")
                         {
                             thinkingStarted = true;
-                            placeholderId ??= await SendAsync(chatId, "🤔 Thinking…");
+                            placeholderId ??= await SendAsync(chatId, "🤔 در حال فکر کردن…");
                         }
                         break;
-
                     case "message.part.delta":
-                        if (evt.Properties.TryGetProperty("field", out var field) && field.GetString() == "text" &&
-                            evt.Properties.TryGetProperty("delta", out var delta))
+                        if (evt.Properties.TryGetProperty("field", out var field) && field.GetString() == "text" && evt.Properties.TryGetProperty("delta", out var delta))
                         {
                             var s = delta.GetString();
                             if (!string.IsNullOrEmpty(s)) accumulated.Append(s);
                         }
                         break;
-
                     case "session.idle":
                         if (MatchesSession(evt.Properties, openCodeSessionId))
                         {
@@ -383,27 +554,20 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
                             return;
                         }
                         break;
-
                     case "session.error":
                         if (MatchesSession(evt.Properties, openCodeSessionId))
                         {
-                            var msg = evt.Properties.TryGetProperty("error", out var err) &&
-                                      err.TryGetProperty("data", out var data) &&
-                                      data.TryGetProperty("message", out var dm)
+                            var msg = evt.Properties.TryGetProperty("error", out var err) && err.TryGetProperty("data", out var data) && data.TryGetProperty("message", out var dm)
                                 ? dm.GetString()
-                                : "Unknown error";
+                                : "خطای نامشخص";
                             if (placeholderId is { } pid) await TryDeleteAsync(chatId, pid);
-                            await SendAsync(chatId, $"❌ Error: {msg}");
+                            await SendAsync(chatId, $"❌ خطا: {msg}", MainMenuOnlyKeyboard());
                             _inFlight.TryRemove(chatId, out _);
                             return;
                         }
                         break;
-
-                    // Confirmed live on this OpenCode install (see README "Permission approvals"):
-                    // the legacy `permission.asked` event/endpoint namespace, not `permission.v2.*`.
                     case "permission.asked":
-                        if (MatchesSession(evt.Properties, openCodeSessionId))
-                            await HandlePermissionAskedAsync(chatId, state.ProjectPath, evt.Properties);
+                        if (MatchesSession(evt.Properties, openCodeSessionId)) await HandlePermissionAskedAsync(chatId, projectPath, evt.Properties);
                         break;
                 }
             }
@@ -411,13 +575,13 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         catch (OperationCanceledException)
         {
             if (placeholderId is { } pid) await TryDeleteAsync(chatId, pid);
-            await SendAsync(chatId, "⏹️ Aborted.");
+            await SendAsync(chatId, "⏹ درخواست لغو شد.", MainMenuOnlyKeyboard());
         }
         catch (Exception ex)
         {
             _log.Error($"[prompt] chat={chatId} error={ex.Message}");
             if (placeholderId is { } pid) await TryDeleteAsync(chatId, pid);
-            await SendAsync(chatId, $"❌ Error: {ex.Message}");
+            await SendAsync(chatId, $"❌ خطا: {ex.Message}", MainMenuOnlyKeyboard());
         }
         finally
         {
@@ -428,20 +592,12 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     private static bool MatchesSession(JsonElement properties, string sessionId) =>
         properties.TryGetProperty("sessionID", out var sid) && sid.GetString() == sessionId;
 
-    // ───────────────────────── Permission approvals ─────────────────────────
-
-    /// <summary>
-    /// Fired when OpenCode's /event stream emits a live `permission.asked` frame (see
-    /// Models/PermissionModels.cs for how this shape was confirmed against a real running
-    /// `opencode serve`). Tracks the request and asks the user in Telegram with inline buttons.
-    /// </summary>
     private async Task HandlePermissionAskedAsync(long chatId, string projectPath, JsonElement properties)
     {
         PermissionAskedEvent asked;
         try
         {
-            asked = properties.Deserialize<PermissionAskedEvent>()
-                    ?? throw new InvalidOperationException("null payload");
+            asked = properties.Deserialize<PermissionAskedEvent>() ?? throw new InvalidOperationException("null payload");
         }
         catch (Exception ex)
         {
@@ -470,108 +626,269 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             $"Resources:\n{resourcesText}\n\n" +
             "Reply with one of the buttons below.";
 
-        // Keep callback data short (Telegram caps it at 64 bytes) — encode just the reply kind
-        // + request id; the rest is looked up from _pendingPermissions when the button is tapped.
-        var keyboard = new Telegram.Bot.Types.ReplyMarkups.InlineKeyboardMarkup(new[]
+        var keyboard = new InlineKeyboardMarkup(new[]
         {
-            Telegram.Bot.Types.ReplyMarkups.InlineKeyboardButton.WithCallbackData("✅ Once", $"perm:once:{asked.Id}"),
-            Telegram.Bot.Types.ReplyMarkups.InlineKeyboardButton.WithCallbackData("🔁 Always", $"perm:always:{asked.Id}"),
-            Telegram.Bot.Types.ReplyMarkups.InlineKeyboardButton.WithCallbackData("❌ Reject", $"perm:reject:{asked.Id}"),
+            InlineKeyboardButton.WithCallbackData("✅ Once", $"perm:once:{asked.Id}"),
+            InlineKeyboardButton.WithCallbackData("🔁 Always", $"perm:always:{asked.Id}"),
+            InlineKeyboardButton.WithCallbackData("❌ Reject", $"perm:reject:{asked.Id}"),
         });
 
         var messageId = await SendAsync(chatId, text, keyboard);
         if (messageId is { } mid) pending.MessageId = mid;
     }
 
-    /// <summary>Handles a tap on one of the ✅/🔁/❌ inline buttons attached by
-    /// <see cref="HandlePermissionAskedAsync"/>, replying to OpenCode and updating the message.</summary>
-    private async Task HandleCallbackQueryAsync(Telegram.Bot.Types.CallbackQuery cq)
+    private async Task HandleCallbackQueryAsync(CallbackQuery cq)
     {
-        var data = cq.Data;
+        var data = cq.Data ?? "";
         var chatId = cq.Message?.Chat.Id ?? cq.From.Id;
+        var messageId = cq.Message?.MessageId;
         try
         {
-            if (string.IsNullOrEmpty(data) || !data.StartsWith("perm:"))
+            if (cq.Message?.Chat.Type != ChatType.Private && !data.StartsWith("perm:", StringComparison.Ordinal))
             {
                 await AnswerCallbackAsync(cq.Id, null);
                 return;
             }
-
-            var parts = data.Split(':', 3);
-            if (parts.Length != 3)
+            if (!IsAllowed(cq.From.Id))
             {
-                await AnswerCallbackAsync(cq.Id, null);
+                await AnswerCallbackAsync(cq.Id, "اجازه دسترسی ندارید.");
                 return;
             }
-            var replyKind = parts[1]; // "once" | "always" | "reject"
-            var requestId = parts[2];
+            await AnswerCallbackAsync(cq.Id, null);
 
-            if (!_pendingPermissions.TryRemove(requestId, out var pending))
+            if (data.StartsWith("perm:", StringComparison.Ordinal))
             {
-                await AnswerCallbackAsync(cq.Id, "Already answered or expired.");
-                if (cq.Message is { } staleMsg)
-                    await TryEditAsync(staleMsg.Chat.Id, staleMsg.MessageId, staleMsg.Text + "\n\n(No longer pending.)");
+                await HandlePermissionCallbackAsync(cq, data);
                 return;
             }
+            if (string.IsNullOrWhiteSpace(data)) return;
 
-            var session = _openCode.ActiveSessions.FirstOrDefault(s => s.ProjectPath == pending.ProjectPath && !s.Exited);
-            if (session == null)
+            var parts = data.Split(':');
+            switch (parts[0])
             {
-                await AnswerCallbackAsync(cq.Id, "Project server is no longer running.");
-                await TryEditAsync(pending.ChatId, pending.MessageId,
-                    "⚠️ Could not reply — the OpenCode server for this project is no longer running.");
-                return;
-            }
-
-            try
-            {
-                await _openCode.ReplyPermissionAsync(session, requestId, replyKind);
-                var outcome = replyKind switch
-                {
-                    "once" => "✅ Approved (once)",
-                    "always" => "🔁 Always approved",
-                    "reject" => "❌ Rejected",
-                    _ => $"Replied: {replyKind}",
-                };
-                await TryEditAsync(pending.ChatId, pending.MessageId,
-                    $"{outcome}\nProject: {pending.ProjectName}\nAction: {pending.Action}");
-                await AnswerCallbackAsync(cq.Id, null);
-            }
-            catch (Exception ex)
-            {
-                _log.Error($"[permission] reply failed for {requestId}: {ex.Message}");
-                await TryEditAsync(pending.ChatId, pending.MessageId,
-                    $"⚠️ Failed to send your decision to OpenCode: {ex.Message}");
-                await AnswerCallbackAsync(cq.Id, "Failed — see log.");
+                case "menu":
+                    await HandleMenuCallbackAsync(chatId, cq.From.Id, messageId, parts);
+                    break;
+                case "project":
+                    await HandleProjectCallbackAsync(chatId, cq.From.Id, messageId, parts);
+                    break;
+                case "model":
+                    await HandleModelCallbackAsync(chatId, cq.From.Id, messageId, parts);
+                    break;
             }
         }
         catch (Exception ex)
         {
-            _log.Error($"[permission] callback handling error: {ex.Message}");
-            await AnswerCallbackAsync(cq.Id, null);
+            _log.Error($"[callback] handling error: {ex.Message}");
+            await AnswerCallbackAsync(cq.Id, "خطا رخ داد.");
         }
     }
 
-    private async Task AnswerCallbackAsync(string callbackQueryId, string? text)
+    private async Task HandleMenuCallbackAsync(long chatId, long userId, int? messageId, string[] parts)
     {
-        if (_client == null) return;
-        try { await _client.AnswerCallbackQuery(callbackQueryId, text); }
-        catch { /* best effort */ }
+        if (parts.Length < 2) return;
+        switch (parts[1])
+        {
+            case "main": await ShowMainMenuAsync(chatId, userId, messageId); break;
+            case "projects": await ShowProjectsAsync(chatId, userId, messageId); break;
+            case "models": await ShowModelProvidersAsync(chatId, userId, messageId, refresh: true); break;
+            case "status": await ShowStatusAsync(chatId, userId, messageId); break;
+            case "abort": await AbortPromptAsync(chatId, userId, messageId); break;
+            case "stop": await StopProjectServerAsync(chatId, userId, messageId); break;
+            case "help": await SendOrEditMenuAsync(chatId, messageId, HelpText(), MainMenuOnlyKeyboard()); break;
+        }
     }
 
-    private async Task TryEditAsync(long chatId, long? messageId, string text)
+    private async Task HandleProjectCallbackAsync(long chatId, long userId, int? messageId, string[] parts)
     {
-        if (_client == null || messageId is not { } mid) return;
-        try { await _client.EditMessageText(chatId, (int)mid, text); }
-        catch { /* best effort — message may have been deleted, or text unchanged */ }
+        if (parts.Length < 2) return;
+        if (parts[1] == "page" && parts.Length == 4 && int.TryParse(parts[3], out var page))
+        {
+            await ShowProjectsAsync(chatId, userId, messageId, page);
+            return;
+        }
+        if (parts[1] == "select" && parts.Length == 4 && TryResolveToken(parts[2], parts[3], chatId, userId, messageId, MenuItemKind.Project, out var token))
+        {
+            await SelectProjectPathAsync(chatId, userId, token.Value, messageId);
+        }
+        else
+        {
+            await SendOrEditMenuAsync(chatId, messageId, "این دکمه منقضی شده است. فهرست تازه را باز کنید.", ProjectsOnlyKeyboard());
+        }
+    }
+
+    private async Task HandleModelCallbackAsync(long chatId, long userId, int? messageId, string[] parts)
+    {
+        if (parts.Length < 2) return;
+        if (parts[1] == "refresh") { await ShowModelProvidersAsync(chatId, userId, messageId, refresh: true); return; }
+        if (parts[1] == "default" && parts.Length == 3)
+        {
+            if (!TryValidateSnapshot(parts[2], chatId, userId, messageId))
+                await SendOrEditMenuAsync(chatId, messageId, "این دکمه منقضی شده است. منوی مدل را دوباره باز کنید.", ChangeModelOnlyKeyboard());
+            else
+                await SetModelAsync(chatId, userId, null, messageId);
+            return;
+        }
+        if (parts[1] == "provider" && parts.Length == 4 && TryResolveToken(parts[2], parts[3], chatId, userId, messageId, MenuItemKind.Provider, out var providerToken))
+        {
+            await ShowModelsForProviderAsync(chatId, userId, providerToken.Value, messageId);
+            return;
+        }
+        if (parts[1] == "select" && parts.Length == 4 && TryResolveToken(parts[2], parts[3], chatId, userId, messageId, MenuItemKind.Model, out var modelToken))
+        {
+            await SetModelAsync(chatId, userId, modelToken.Value, messageId);
+            return;
+        }
+        if (parts[1] == "page" && parts.Length == 5 && int.TryParse(parts[4], out var page) &&
+            TryResolveToken(parts[2], parts[3], chatId, userId, messageId, MenuItemKind.Provider, out var providerPageToken))
+        {
+            await ShowModelsForProviderAsync(chatId, userId, providerPageToken.Value, messageId, page);
+            return;
+        }
+        await SendOrEditMenuAsync(chatId, messageId, "این دکمه منقضی شده است. منوی مدل را دوباره باز کنید.", ChangeModelOnlyKeyboard());
+    }
+
+    private async Task HandlePermissionCallbackAsync(CallbackQuery cq, string data)
+    {
+        var parts = data.Split(':', 3);
+        if (parts.Length != 3) return;
+        var replyKind = parts[1];
+        if (replyKind is not ("once" or "always" or "reject")) return;
+        var requestId = parts[2];
+        if (!_pendingPermissions.TryGetValue(requestId, out var pending))
+        {
+            if (cq.Message is { } staleMsg) await TryEditAsync(staleMsg.Chat.Id, staleMsg.MessageId, staleMsg.Text + "\n\n(No longer pending.)");
+            return;
+        }
+        if (pending.ChatId != (cq.Message?.Chat.Id ?? cq.From.Id)) return;
+        if (!_pendingPermissions.TryRemove(requestId, out pending)) return;
+
+        var session = _openCode.ActiveSessions.FirstOrDefault(s => s.ProjectPath == pending.ProjectPath && !s.Exited);
+        if (session == null)
+        {
+            await TryEditAsync(pending.ChatId, pending.MessageId, "⚠️ Could not reply — the OpenCode server for this project is no longer running.");
+            return;
+        }
+        try
+        {
+            await _openCode.ReplyPermissionAsync(session, requestId, replyKind);
+            var outcome = replyKind switch
+            {
+                "once" => "✅ Approved (once)",
+                "always" => "🔁 Always approved",
+                "reject" => "❌ Rejected",
+                _ => $"Replied: {replyKind}",
+            };
+            await TryEditAsync(pending.ChatId, pending.MessageId, $"{outcome}\nProject: {pending.ProjectName}\nAction: {pending.Action}");
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"[permission] reply failed for {requestId}: {ex.Message}");
+            await TryEditAsync(pending.ChatId, pending.MessageId, $"⚠️ Failed to send your decision to OpenCode: {ex.Message}");
+        }
+    }
+
+    private MenuSnapshot CreateSnapshot(long chatId, long userId, int messageId)
+    {
+        var snapshot = new MenuSnapshot { Id = NewToken(), ChatId = chatId, UserId = userId, MessageId = messageId };
+        _snapshots[snapshot.Id] = snapshot;
+        return snapshot;
+    }
+
+    private static string AddToken(MenuSnapshot snapshot, MenuItemKind kind, string value)
+    {
+        var token = NewToken();
+        snapshot.Tokens[token] = new MenuItemToken { Token = token, Kind = kind, Value = value };
+        return token;
+    }
+
+    private bool TryResolveToken(string snapshotId, string tokenId, long chatId, long userId, int? messageId, MenuItemKind kind, out MenuItemToken token)
+    {
+        token = null!;
+        if (!TryValidateSnapshot(snapshotId, chatId, userId, messageId)) return false;
+        if (!_snapshots[snapshotId].Tokens.TryGetValue(tokenId, out var resolved)) return false;
+        token = resolved;
+        return token.Kind == kind;
+    }
+
+    private bool TryValidateSnapshot(string snapshotId, long chatId, long userId, int? messageId)
+    {
+        CleanupSnapshots();
+        if (!_snapshots.TryGetValue(snapshotId, out var snapshot)) return false;
+        if (snapshot.ChatId != chatId || snapshot.UserId != userId) return false;
+        return snapshot.MessageId == 0 || messageId == null || snapshot.MessageId == messageId;
+    }
+
+    private void CleanupSnapshots()
+    {
+        var cutoff = DateTimeOffset.UtcNow - SnapshotTtl;
+        foreach (var pair in _snapshots.ToArray())
+        {
+            if (pair.Value.CreatedAt < cutoff) _snapshots.TryRemove(pair.Key, out _);
+        }
+        if (_snapshots.Count <= 100) return;
+        foreach (var old in _snapshots.OrderBy(p => p.Value.CreatedAt).Take(_snapshots.Count - 100))
+            _snapshots.TryRemove(old.Key, out _);
+    }
+
+    private static string NewToken() => Convert.ToHexString(Guid.NewGuid().ToByteArray()).ToLowerInvariant()[..12];
+
+    private static List<string> BuildProjectLabels(List<(string Name, string Path)> projects)
+    {
+        return TelegramMenuLogic.BuildProjectLabels(projects);
+    }
+
+    private static void AddPager(List<InlineKeyboardButton[]> rows, string prefix, string snapshotId, int page, int count, string? extraToken = null)
+    {
+        var maxPage = Math.Max(0, (count - 1) / PageSize);
+        if (maxPage == 0) return;
+        var buttons = new List<InlineKeyboardButton>();
+        var baseData = extraToken == null ? $"{prefix}:{snapshotId}" : $"{prefix}:{snapshotId}:{extraToken}";
+        if (page > 0) buttons.Add(InlineKeyboardButton.WithCallbackData("⬅️ قبلی", $"{baseData}:{page - 1}"));
+        buttons.Add(InlineKeyboardButton.WithCallbackData($"{page + 1}/{maxPage + 1}", "menu:noop"));
+        if (page < maxPage) buttons.Add(InlineKeyboardButton.WithCallbackData("بعدی ➡️", $"{baseData}:{page + 1}"));
+        rows.Add(buttons.ToArray());
+    }
+
+    private bool IsProjectRunning(string projectPath) => _openCode.ActiveSessions.Any(s => s.ProjectPath == projectPath && !s.Exited);
+    private string? GetSelectedProjectName(string? projectPath) => projectPath == null ? null : Path.GetFileName(projectPath.TrimEnd('/'));
+
+    private static InlineKeyboardMarkup MainMenuOnlyKeyboard() => new(new[] { new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") } });
+    private static InlineKeyboardMarkup ProjectsOnlyKeyboard() => new(new[] { new[] { InlineKeyboardButton.WithCallbackData("📁 انتخاب پروژه", "menu:projects") }, new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") } });
+    private static InlineKeyboardMarkup ChangeModelOnlyKeyboard() => new(new[] { new[] { InlineKeyboardButton.WithCallbackData("🧠 تغییر مدل", "menu:models") }, new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") } });
+
+    private static string HelpText() =>
+        "❓ راهنما\n\n" +
+        "با /menu منوی دکمه‌ای را باز کنید.\n" +
+        "دستورهای متنی هنوز فعال هستند:\n" +
+        "/projects، /use <name>، /models، /model <provider/model>، /model default، /status، /stop، /abort\n\n" +
+        "بعد از انتخاب پروژه، هر متن معمولی به عنوان درخواست برای OpenCode ارسال می‌شود.";
+
+    private async Task<long?> SendOrEditMenuAsync(long chatId, int? messageId, string text, InlineKeyboardMarkup replyMarkup)
+    {
+        if (_client == null) return null;
+        if (messageId is { } mid)
+        {
+            try
+            {
+                var edited = await _client.EditMessageText(chatId, mid, text, replyMarkup: replyMarkup);
+                return edited.MessageId;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Menu edit failed for {chatId}/{mid}: {ex.Message}; sending replacement");
+            }
+        }
+        return await SendAsync(chatId, text, replyMarkup);
     }
 
     private async Task FinishAsync(long chatId, long? placeholderId, string text)
     {
         if (placeholderId is { } pid) await TryDeleteAsync(chatId, pid);
-        var finalText = string.IsNullOrWhiteSpace(text) ? "✅ Done." : text;
-        foreach (var chunk in SplitMessage(finalText))
-            await SendAsync(chatId, chunk);
+        var finalText = string.IsNullOrWhiteSpace(text) ? "✅ انجام شد." : text;
+        var chunks = SplitMessage(finalText).ToList();
+        for (var i = 0; i < chunks.Count; i++)
+            await SendAsync(chatId, chunks[i], i == chunks.Count - 1 ? MainMenuOnlyKeyboard() : null);
     }
 
     private static IEnumerable<string> SplitMessage(string text)
@@ -581,9 +898,21 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             yield return text.Substring(i, Math.Min(TelegramMessageLimit, text.Length - i));
     }
 
-    // ───────────────────────── Telegram send helpers ─────────────────────────
+    private async Task AnswerCallbackAsync(string callbackQueryId, string? text)
+    {
+        if (_client == null) return;
+        try { await _client.AnswerCallbackQuery(callbackQueryId, text); }
+        catch { }
+    }
 
-    private async Task<long?> SendAsync(long chatId, string text, Telegram.Bot.Types.ReplyMarkups.InlineKeyboardMarkup? replyMarkup = null)
+    private async Task TryEditAsync(long chatId, long? messageId, string text)
+    {
+        if (_client == null || messageId is not { } mid) return;
+        try { await _client.EditMessageText(chatId, (int)mid, text); }
+        catch { }
+    }
+
+    private async Task<long?> SendAsync(long chatId, string text, InlineKeyboardMarkup? replyMarkup = null)
     {
         if (_client == null) return null;
         try
@@ -602,7 +931,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     {
         if (_client == null) return;
         try { await _client.DeleteMessage(chatId, (int)messageId); }
-        catch { /* best effort */ }
+        catch { }
     }
 
     public async ValueTask DisposeAsync() => await DisconnectAsync();
