@@ -10,18 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- The vendored WTelegramClient lives under its own .csproj (ProjectReference below) —
-         exclude its files from this project's own default compile globbing, otherwise the
-         same types get compiled twice (once here, once into WTelegramClient.dll) and collide. -->
-    <Compile Remove="vendor/**/*.cs" />
-    <Content Remove="vendor/**" />
-    <None Remove="vendor/**" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <!-- Vendored source build of WTelegramClient (MTProto), see vendor/README.md.
-         No NuGet package is used so the whole solution builds fully offline. -->
-    <ProjectReference Include="vendor\WTelegramClient-src\WTelegramClient.csproj" />
+    <PackageReference Include="Telegram.Bot" Version="22.10.3.1" />
   </ItemGroup>
 
 </Project>

@@ -52,7 +52,7 @@
 <body>
 <div class="wrap">
   <h1>OpenCode Telegram Bridge</h1>
-  <div class="sub">Self-hosted dashboard — remote-controls opencode from Telegram over MTProto.</div>
+  <div class="sub">Self-hosted dashboard — remote-controls opencode from Telegram via the Bot API.</div>
 
   <div class="card">
     <h2>Status</h2>
@@ -71,24 +71,14 @@
   <div class="card">
     <h2>Settings</h2>
     <form id="cfgForm">
-      <div class="grid">
-        <div class="field">
-          <label>API ID <span style="color:var(--muted)">(my.telegram.org/apps)</span></label>
-          <input name="apiId" type="number" required />
-        </div>
-        <div class="field">
-          <label>API Hash</label>
-          <input name="apiHash" required />
-        </div>
-      </div>
       <div class="field">
         <label>Bot Token <span style="color:var(--muted)">(@BotFather)</span></label>
         <input name="botToken" required />
       </div>
       <div class="field">
-        <label>MTProxy URL <span style="color:var(--muted)">(optional — https://t.me/proxy?server=...)</span></label>
-        <input name="mtProxyUrl" placeholder="leave empty to connect directly" />
-        <div class="hint">Use this if Telegram is blocked on this network but an MTProxy is reachable.</div>
+        <label>SOCKS5 Proxy URL <span style="color:var(--muted)">(optional)</span></label>
+        <input name="socks5ProxyUrl" placeholder="socks5://127.0.0.1:1080 — leave empty to connect directly" />
+        <div class="hint">Local SOCKS5 port exposed by a V2ray/Xray client you run yourself — not a Telegram MTProxy link. Use this if Telegram is blocked directly on this network.</div>
       </div>
       <div class="grid">
         <div class="field">
@@ -153,10 +143,8 @@ async function loadConfig() {
   const r = await fetch('/api/config');
   const c = await r.json();
   const f = document.getElementById('cfgForm');
-  f.apiId.value = c.apiId || '';
-  f.apiHash.value = c.apiHash || '';
   f.botToken.value = c.botToken || '';
-  f.mtProxyUrl.value = c.mtProxyUrl || '';
+  f.socks5ProxyUrl.value = c.socks5ProxyUrl || '';
   f.allowedUserIds.value = (c.allowedUserIds || []).join(', ');
   f.idleTimeoutMinutes.value = c.idleTimeoutMinutes || 10;
   f.projectsBasePaths.value = (c.projectsBasePaths || []).join(', ');
@@ -168,10 +156,8 @@ document.getElementById('cfgForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = e.target;
   const body = {
-    apiId: parseInt(f.apiId.value || '0', 10),
-    apiHash: f.apiHash.value.trim(),
     botToken: f.botToken.value.trim(),
-    mtProxyUrl: f.mtProxyUrl.value.trim() || null,
+    socks5ProxyUrl: f.socks5ProxyUrl.value.trim() || null,
     allowedUserIds: f.allowedUserIds.value.split(',').map(s => s.trim()).filter(Boolean).map(Number),
     projectsBasePaths: f.projectsBasePaths.value.split(',').map(s => s.trim()).filter(Boolean),
     openCodeCommand: f.openCodeCommand.value.trim() || 'opencode',

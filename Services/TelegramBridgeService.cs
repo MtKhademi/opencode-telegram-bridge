@@ -2,15 +2,20 @@ using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using OpenCodeTelegramBridge.Models;
-using TL;
+using Telegram.Bot;
+using Telegram.Bot.Exceptions;
+using Telegram.Bot.Polling;
+using Telegram.Bot.Types;
+using Telegram.Bot.Types.Enums;
 
 namespace OpenCodeTelegramBridge.Services;
 
 /// <summary>
-/// Connects to Telegram over raw MTProto (via WTelegramClient) instead of the classic HTTP
-/// Bot API. This is what lets the bot connect through an MTProxy — the HTTP Bot API (used by
-/// most Telegram bot frameworks) has no concept of MTProxy, only the native MTProto protocol
-/// implemented here does.
+/// Connects to Telegram over the classic HTTP Bot API (via the Telegram.Bot NuGet package)
+/// using just a bot token — no api_id/api_hash from my.telegram.org required. When
+/// api.telegram.org is blocked directly on this network, route through a local SOCKS5 proxy
+/// (e.g. exposed by a V2ray/Xray client) via <see cref="AppConfig.Socks5ProxyUrl"/> — .NET's
+/// SocketsHttpHandler supports socks5:// proxies natively.
 ///
 /// Bridges Telegram chats to per-project `opencode serve` instances managed by <see cref="OpenCodeManager"/>.
 /// </summary>
@@ -24,8 +29,9 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     private readonly ConcurrentDictionary<long, ChatState> _chatStates = new();
     private readonly ConcurrentDictionary<long, CancellationTokenSource> _inFlight = new();
 
-    private WTelegram.Client? _client;
-    private WTelegram.UpdateManager? _manager;
+    private TelegramBotClient? _client;
+    private HttpClient? _httpClient;
+    private CancellationTokenSource? _receiveCts;
 
     public bool IsConnected { get; private set; }
     public string? BotUsername { get; private set; }
@@ -37,11 +43,6 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         _configStore = configStore;
         _openCode = openCode;
         _log = log;
-        WTelegram.Helpers.Log = (level, message) =>
-        {
-            if (level >= 3) _log.Warn(message);
-            // levels 0-2 are verbose protocol chatter — keep the dashboard log readable
-        };
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -66,33 +67,37 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
 
         try
         {
-            _client = new WTelegram.Client(what => what switch
+            if (!string.IsNullOrWhiteSpace(config.Socks5ProxyUrl))
             {
-                "api_id" => config.ApiId.ToString(),
-                "api_hash" => config.ApiHash,
-                "bot_token" => config.BotToken,
-                "device_model" => "OpenCodeTelegramBridge",
-                "session_pathname" => _configStore.SessionFilePath,
-                _ => null
-            });
-
-            if (!string.IsNullOrWhiteSpace(config.MtProxyUrl))
-            {
-                _client.MTProxyUrl = config.MtProxyUrl;
-                _log.Info("Connecting to Telegram via MTProxy…");
+                var handler = new SocketsHttpHandler
+                {
+                    Proxy = new System.Net.WebProxy(new Uri(config.Socks5ProxyUrl)),
+                    UseProxy = true,
+                };
+                _httpClient = new HttpClient(handler);
+                _client = new TelegramBotClient(config.BotToken, _httpClient);
+                _log.Info("Connecting to Telegram via SOCKS5 proxy…");
             }
             else
             {
+                _client = new TelegramBotClient(config.BotToken);
                 _log.Info("Connecting to Telegram directly…");
             }
 
-            _manager = _client.WithUpdateManager(OnUpdateAsync);
-            var me = await _client.LoginBotIfNeeded(config.BotToken);
-            BotId = me.id;
-            BotUsername = me.username;
+            var me = await _client.GetMe();
+            BotId = me.Id;
+            BotUsername = me.Username;
+
+            _receiveCts = new CancellationTokenSource();
+            _client.StartReceiving(
+                updateHandler: OnUpdateAsync,
+                errorHandler: OnPollingErrorAsync,
+                receiverOptions: new ReceiverOptions { AllowedUpdates = new[] { UpdateType.Message } },
+                cancellationToken: _receiveCts.Token);
+
             IsConnected = true;
             LastError = null;
-            _log.Info($"Connected as @{me.username} ({me.id})");
+            _log.Info($"Connected as @{me.Username} ({me.Id})");
         }
         catch (Exception ex)
         {
@@ -105,22 +110,37 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     private async Task DisconnectAsync()
     {
         IsConnected = false;
-        _manager = null;
-        if (_client != null)
+        if (_receiveCts != null)
         {
-            var client = _client;
-            _client = null;
-            try { await client.DisposeAsync(); } catch { /* ignore */ }
+            try { await _receiveCts.CancelAsync(); } catch { /* ignore */ }
+            _receiveCts.Dispose();
+            _receiveCts = null;
+        }
+        _client = null;
+        if (_httpClient != null)
+        {
+            _httpClient.Dispose();
+            _httpClient = null;
         }
     }
 
     // ───────────────────────── Update handling ─────────────────────────
 
-    private Task OnUpdateAsync(Update update)
+    private Task OnUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
         // fire-and-forget so a slow prompt doesn't block the update pump
-        if (update is UpdateNewMessage { message: Message m } && !m.flags.HasFlag(Message.Flags.out_))
+        if (update.Message is { } m)
             _ = Task.Run(() => HandleMessageAsync(m));
+        return Task.CompletedTask;
+    }
+
+    private Task OnPollingErrorAsync(ITelegramBotClient botClient, Exception exception, HandleErrorSource source, CancellationToken cancellationToken)
+    {
+        var message = exception is ApiRequestException apiEx
+            ? $"Telegram API error: [{apiEx.ErrorCode}] {apiEx.Message}"
+            : exception.Message;
+        LastError = message;
+        _log.Error($"Polling error: {message}");
         return Task.CompletedTask;
     }
 
@@ -128,8 +148,8 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     {
         try
         {
-            if (m.peer_id is not PeerUser pu) return; // v1: private chats with the bot only
-            var chatId = pu.user_id;
+            if (m.Chat.Type != ChatType.Private) return; // v1: private chats with the bot only
+            var chatId = m.Chat.Id;
             var config = _configStore.Current;
 
             if (config.AllowedUserIds.Count > 0 && !config.AllowedUserIds.Contains(chatId))
@@ -139,7 +159,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
                 return;
             }
 
-            var text = m.message?.Trim();
+            var text = m.Text?.Trim();
             if (string.IsNullOrEmpty(text)) return;
 
             if (text.StartsWith('/'))
@@ -383,13 +403,11 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
 
     private async Task<long?> SendAsync(long chatId, string text)
     {
-        if (_client == null || _manager == null) return null;
+        if (_client == null) return null;
         try
         {
-            var peer = ResolvePeer(chatId);
-            if (peer == null) return null;
-            var msg = await _client.SendMessageAsync(peer, text);
-            return msg?.id;
+            var msg = await _client.SendMessage(chatId, text);
+            return msg.MessageId;
         }
         catch (Exception ex)
         {
@@ -401,14 +419,8 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     private async Task TryDeleteAsync(long chatId, long messageId)
     {
         if (_client == null) return;
-        try { await _client.Messages_DeleteMessages(new[] { (int)messageId }); }
+        try { await _client.DeleteMessage(chatId, (int)messageId); }
         catch { /* best effort */ }
-    }
-
-    private InputPeer? ResolvePeer(long chatId)
-    {
-        if (_manager == null) return null;
-        return _manager.Users.TryGetValue(chatId, out var user) ? user.ToInputPeer() : null;
     }
 
     public async ValueTask DisposeAsync() => await DisconnectAsync();

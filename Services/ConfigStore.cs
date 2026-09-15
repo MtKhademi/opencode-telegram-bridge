@@ -56,8 +56,4 @@ public class ConfigStore
             File.WriteAllText(ConfigPath, json);
         }
     }
-
-    /// <summary>Full path to the bot's SQLite-free session state file (WTelegramClient's own
-    /// binary session store), kept in the data folder so logins survive restarts.</summary>
-    public string SessionFilePath => Path.Combine(DataDir, "bridge.session");
 }

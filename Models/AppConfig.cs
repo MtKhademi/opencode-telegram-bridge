@@ -3,21 +3,14 @@ namespace OpenCodeTelegramBridge.Models;
 /// <summary>Persisted application configuration (stored as data/config.json).</summary>
 public class AppConfig
 {
-    /// <summary>api_id from https://my.telegram.org/apps — required by the MTProto protocol,
-    /// even when logging in as a bot (this is different from the Bot API and is NOT the bot token).</summary>
-    public int ApiId { get; set; }
-
-    /// <summary>api_hash from https://my.telegram.org/apps.</summary>
-    public string ApiHash { get; set; } = "";
-
     /// <summary>Bot token from @BotFather.</summary>
     public string BotToken { get; set; } = "";
 
-    /// <summary>Optional MTProxy link (https://t.me/proxy?server=...&amp;port=...&amp;secret=...).
-    /// Use this when api.telegram.org / the Telegram DCs are blocked on this network but an
-    /// MTProxy is reachable — WTelegramClient connects over raw MTProto so it can tunnel
-    /// through an MTProxy, unlike the classic HTTP Bot API.</summary>
-    public string? MtProxyUrl { get; set; }
+    /// <summary>Optional local SOCKS5 proxy (format: "socks5://host:port", e.g.
+    /// "socks5://127.0.0.1:1080"). Use this when api.telegram.org is blocked directly on this
+    /// network but a local V2ray/Xray client exposes a SOCKS5 listener that can reach it —
+    /// .NET's SocketsHttpHandler routes the classic HTTP Bot API traffic through it natively.</summary>
+    public string? Socks5ProxyUrl { get; set; }
 
     /// <summary>Telegram numeric user IDs allowed to use the bot. Empty = allow anyone (not recommended).</summary>
     public List<long> AllowedUserIds { get; set; } = new();
@@ -37,8 +30,6 @@ public class AppConfig
     public int IdleTimeoutMinutes { get; set; } = 10;
 
     public bool IsComplete =>
-        ApiId > 0 &&
-        !string.IsNullOrWhiteSpace(ApiHash) &&
         !string.IsNullOrWhiteSpace(BotToken) &&
         ProjectsBasePaths.Count > 0;
 }
