@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenCode Telegram Bridge</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161922; --panel-2: #1d212c; --border: #262b38;
+    --text: #e7e9ee; --muted: #8a90a2; --accent: #5b8cff; --good: #3ecf8e;
+    --bad: #ff5d6c; --warn: #f5b942;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 14px; font-weight: 600; }
+  .row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); flex: none; }
+  .dot.on { background: var(--good); }
+  .status-line { font-size: 14px; }
+  .status-line b { font-weight: 600; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+  input, textarea { width: 100%; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); padding: 9px 10px; font-size: 13px; font-family: inherit; }
+  textarea { min-height: 56px; resize: vertical; }
+  .field { margin-bottom: 14px; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  button { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 16px;
+    font-size: 13px; font-weight: 600; cursor: pointer; }
+  button:hover { filter: brightness(1.08); }
+  button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  .toast { font-size: 12px; margin-left: 10px; color: var(--good); }
+  .sessions { display: flex; flex-direction: column; gap: 8px; }
+  .session { display: flex; justify-content: space-between; align-items: center; background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+  .session .meta { color: var(--muted); font-size: 12px; }
+  .empty { color: var(--muted); font-size: 13px; }
+  .log { background: #0a0c10; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    height: 220px; overflow-y: auto; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .log .l-info { color: #9fb0c9; }
+  .log .l-warn { color: var(--warn); }
+  .log .l-error { color: var(--bad); }
+  .log .t { color: var(--muted); margin-right: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>OpenCode Telegram Bridge</h1>
+  <div class="sub">Self-hosted dashboard — remote-controls opencode from Telegram over MTProto.</div>
+
+  <div class="card">
+    <h2>Status</h2>
+    <div class="row">
+      <div id="dot" class="dot"></div>
+      <div class="status-line" id="statusLine">Loading…</div>
+    </div>
+    <div class="status-line" id="errorLine" style="color:var(--bad); display:none;"></div>
+  </div>
+
+  <div class="card">
+    <h2>Active projects</h2>
+    <div id="sessions" class="sessions"><div class="empty">None running yet.</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Settings</h2>
+    <form id="cfgForm">
+      <div class="grid">
+        <div class="field">
+          <label>API ID <span style="color:var(--muted)">(my.telegram.org/apps)</span></label>
+          <input name="apiId" type="number" required />
+        </div>
+        <div class="field">
+          <label>API Hash</label>
+          <input name="apiHash" required />
+        </div>
+      </div>
+      <div class="field">
+        <label>Bot Token <span style="color:var(--muted)">(@BotFather)</span></label>
+        <input name="botToken" required />
+      </div>
+      <div class="field">
+        <label>MTProxy URL <span style="color:var(--muted)">(optional — https://t.me/proxy?server=...)</span></label>
+        <input name="mtProxyUrl" placeholder="leave empty to connect directly" />
+        <div class="hint">Use this if Telegram is blocked on this network but an MTProxy is reachable.</div>
+      </div>
+      <div class="grid">
+        <div class="field">
+          <label>Allowed Telegram user IDs <span style="color:var(--muted)">(comma-separated)</span></label>
+          <input name="allowedUserIds" placeholder="123456789, 987654321" />
+        </div>
+        <div class="field">
+          <label>Idle timeout (minutes)</label>
+          <input name="idleTimeoutMinutes" type="number" min="1" />
+        </div>
+      </div>
+      <div class="field">
+        <label>Project folders <span style="color:var(--muted)">(comma-separated, one level of subfolders each)</span></label>
+        <input name="projectsBasePaths" placeholder="/home/me/code, ~/projects" />
+      </div>
+      <div class="grid">
+        <div class="field">
+          <label>OpenCode command</label>
+          <input name="openCodeCommand" placeholder="opencode" />
+        </div>
+        <div class="field">
+          <label>Global opencode.json path <span style="color:var(--muted)">(optional)</span></label>
+          <input name="openCodeConfigPath" placeholder="~/.config/opencode/opencode.json" />
+        </div>
+      </div>
+      <button type="submit">Save &amp; reconnect</button>
+      <span class="toast" id="saveToast" style="display:none;">Saved ✓</span>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Live log</h2>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script>
+async function loadStatus() {
+  const r = await fetch('/api/status');
+  const s = await r.json();
+  document.getElementById('dot').className = 'dot' + (s.connected ? ' on' : '');
+  document.getElementById('statusLine').innerHTML = s.connected
+    ? `Connected as <b>@${s.botUsername}</b>`
+    : (s.configComplete ? '<b>Not connected</b>' : '<b>Setup required</b> — fill in the settings below');
+  const errLine = document.getElementById('errorLine');
+  if (s.lastError) { errLine.style.display = 'block'; errLine.textContent = s.lastError; }
+  else errLine.style.display = 'none';
+
+  const box = document.getElementById('sessions');
+  if (!s.activeSessions || s.activeSessions.length === 0) {
+    box.innerHTML = '<div class="empty">None running yet.</div>';
+  } else {
+    box.innerHTML = s.activeSessions.map(sess => `
+      <div class="session">
+        <div><b>${sess.project}</b><div class="meta">port ${sess.port} · started ${new Date(sess.startedAt).toLocaleTimeString()}</div></div>
+        <div class="meta">${sess.exited ? 'stopped' : 'running'}</div>
+      </div>`).join('');
+  }
+}
+
+async function loadConfig() {
+  const r = await fetch('/api/config');
+  const c = await r.json();
+  const f = document.getElementById('cfgForm');
+  f.apiId.value = c.apiId || '';
+  f.apiHash.value = c.apiHash || '';
+  f.botToken.value = c.botToken || '';
+  f.mtProxyUrl.value = c.mtProxyUrl || '';
+  f.allowedUserIds.value = (c.allowedUserIds || []).join(', ');
+  f.idleTimeoutMinutes.value = c.idleTimeoutMinutes || 10;
+  f.projectsBasePaths.value = (c.projectsBasePaths || []).join(', ');
+  f.openCodeCommand.value = c.openCodeCommand || 'opencode';
+  f.openCodeConfigPath.value = c.openCodeConfigPath || '';
+}
+
+document.getElementById('cfgForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {
+    apiId: parseInt(f.apiId.value || '0', 10),
+    apiHash: f.apiHash.value.trim(),
+    botToken: f.botToken.value.trim(),
+    mtProxyUrl: f.mtProxyUrl.value.trim() || null,
+    allowedUserIds: f.allowedUserIds.value.split(',').map(s => s.trim()).filter(Boolean).map(Number),
+    projectsBasePaths: f.projectsBasePaths.value.split(',').map(s => s.trim()).filter(Boolean),
+    openCodeCommand: f.openCodeCommand.value.trim() || 'opencode',
+    openCodeConfigPath: f.openCodeConfigPath.value.trim() || null,
+    idleTimeoutMinutes: parseInt(f.idleTimeoutMinutes.value || '10', 10),
+  };
+  await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const toast = document.getElementById('saveToast');
+  toast.style.display = 'inline';
+  setTimeout(() => toast.style.display = 'none', 2000);
+  setTimeout(loadStatus, 1500);
+});
+
+function appendLog(entry) {
+  const log = document.getElementById('log');
+  const div = document.createElement('div');
+  const cls = entry.level === 2 ? 'l-error' : entry.level === 1 ? 'l-warn' : 'l-info';
+  const t = new Date(entry.time).toLocaleTimeString();
+  div.className = cls;
+  div.textContent = `${t}  ${entry.message}`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  while (log.childNodes.length > 400) log.removeChild(log.firstChild);
+}
+
+async function loadLog() {
+  const r = await fetch('/api/log');
+  const entries = await r.json();
+  entries.forEach(appendLog);
+}
+
+function connectLogStream() {
+  const es = new EventSource('/api/log/stream');
+  es.onmessage = (ev) => { try { appendLog(JSON.parse(ev.data)); } catch {} };
+  es.onerror = () => { es.close(); setTimeout(connectLogStream, 3000); };
+}
+
+loadStatus(); loadConfig(); loadLog(); connectLogStream();
+setInterval(loadStatus, 4000);
+</script>
+</body>
+</html>

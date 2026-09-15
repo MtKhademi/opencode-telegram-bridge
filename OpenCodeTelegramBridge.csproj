@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AssemblyName>OpenCodeTelegramBridge</AssemblyName>
+    <RootNamespace>OpenCodeTelegramBridge</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The vendored WTelegramClient lives under its own .csproj (ProjectReference below) —
+         exclude its files from this project's own default compile globbing, otherwise the
+         same types get compiled twice (once here, once into WTelegramClient.dll) and collide. -->
+    <Compile Remove="vendor/**/*.cs" />
+    <Content Remove="vendor/**" />
+    <None Remove="vendor/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Vendored source build of WTelegramClient (MTProto), see vendor/README.md.
+         No NuGet package is used so the whole solution builds fully offline. -->
+    <ProjectReference Include="vendor\WTelegramClient-src\WTelegramClient.csproj" />
+  </ItemGroup>
+
+</Project>

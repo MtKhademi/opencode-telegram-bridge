@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Vendored, trimmed build of WTelegramClient (https://github.com/wiz0u/WTelegramClient)
+    for offline compilation. The upstream .csproj pulls in a Roslyn source generator
+    (MTPG) that isn't needed here because the generated TL.*.cs files are already
+    checked into the upstream repo and copied as-is. Targeting net8.0 only means this
+    library needs ZERO external NuGet packages.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>WTelegram</RootNamespace>
+    <Nullable>disable</Nullable>
+    <NoWarn>NETSDK1138;CS0419;CS1573;CS1591;CA1850;CS8600;CS8601;CS8602;CS8603;CS8604;CS8618;CS8625;CS0618</NoWarn>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+</Project>
