@@ -13,4 +13,11 @@
     <PackageReference Include="Telegram.Bot" Version="22.10.3.1" />
   </ItemGroup>
 
+  <!-- data/ holds runtime state (config.json with secrets, session cache, downloaded xray binary) —
+       never bundle it into build/publish output; each deployment gets its own data/ created at first run. -->
+  <ItemGroup>
+    <Content Remove="data/**" />
+    <None Remove="data/**" />
+  </ItemGroup>
+
 </Project>

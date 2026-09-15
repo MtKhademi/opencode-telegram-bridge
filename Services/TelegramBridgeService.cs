@@ -33,6 +33,11 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     private readonly ConcurrentDictionary<long, ChatState> _chatStates = new();
     private readonly ConcurrentDictionary<long, CancellationTokenSource> _inFlight = new();
 
+    /// <summary>Permission requests currently awaiting a Telegram reply, keyed by OpenCode's
+    /// request id ("per_..."). Process-memory only, matching this project's existing pattern for
+    /// chat state — an app restart or unanswered request just drops silently, no persistence.</summary>
+    private readonly ConcurrentDictionary<string, PendingPermission> _pendingPermissions = new();
+
     private TelegramBotClient? _client;
     private HttpClient? _httpClient;
     private CancellationTokenSource? _receiveCts;
@@ -121,7 +126,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             _client.StartReceiving(
                 updateHandler: OnUpdateAsync,
                 errorHandler: OnPollingErrorAsync,
-                receiverOptions: new ReceiverOptions { AllowedUpdates = new[] { UpdateType.Message } },
+                receiverOptions: new ReceiverOptions { AllowedUpdates = new[] { UpdateType.Message, UpdateType.CallbackQuery } },
                 cancellationToken: _receiveCts.Token);
 
             IsConnected = true;
@@ -161,6 +166,8 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         // fire-and-forget so a slow prompt doesn't block the update pump
         if (update.Message is { } m)
             _ = Task.Run(() => HandleMessageAsync(m));
+        else if (update.CallbackQuery is { } cq)
+            _ = Task.Run(() => HandleCallbackQueryAsync(cq));
         return Task.CompletedTask;
     }
 
@@ -391,6 +398,13 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
                             return;
                         }
                         break;
+
+                    // Confirmed live on this OpenCode install (see README "Permission approvals"):
+                    // the legacy `permission.asked` event/endpoint namespace, not `permission.v2.*`.
+                    case "permission.asked":
+                        if (MatchesSession(evt.Properties, openCodeSessionId))
+                            await HandlePermissionAskedAsync(chatId, state.ProjectPath, evt.Properties);
+                        break;
                 }
             }
         }
@@ -414,6 +428,144 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     private static bool MatchesSession(JsonElement properties, string sessionId) =>
         properties.TryGetProperty("sessionID", out var sid) && sid.GetString() == sessionId;
 
+    // ───────────────────────── Permission approvals ─────────────────────────
+
+    /// <summary>
+    /// Fired when OpenCode's /event stream emits a live `permission.asked` frame (see
+    /// Models/PermissionModels.cs for how this shape was confirmed against a real running
+    /// `opencode serve`). Tracks the request and asks the user in Telegram with inline buttons.
+    /// </summary>
+    private async Task HandlePermissionAskedAsync(long chatId, string projectPath, JsonElement properties)
+    {
+        PermissionAskedEvent asked;
+        try
+        {
+            asked = properties.Deserialize<PermissionAskedEvent>()
+                    ?? throw new InvalidOperationException("null payload");
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"[permission] failed to parse permission.asked payload: {ex.Message}");
+            return;
+        }
+
+        var projectName = Path.GetFileName(projectPath.TrimEnd('/'));
+        var pending = new PendingPermission
+        {
+            RequestId = asked.Id,
+            SessionId = asked.SessionID,
+            ChatId = chatId,
+            ProjectPath = projectPath,
+            ProjectName = string.IsNullOrEmpty(projectName) ? projectPath : projectName,
+            Action = asked.Permission,
+            Resources = asked.Patterns,
+        };
+        _pendingPermissions[asked.Id] = pending;
+
+        var resourcesText = pending.Resources.Count > 0 ? string.Join('\n', pending.Resources) : "(none specified)";
+        var text =
+            "⚠️ OpenCode needs your approval\n" +
+            $"Project: {pending.ProjectName}\n" +
+            $"Action: {pending.Action}\n" +
+            $"Resources:\n{resourcesText}\n\n" +
+            "Reply with one of the buttons below.";
+
+        // Keep callback data short (Telegram caps it at 64 bytes) — encode just the reply kind
+        // + request id; the rest is looked up from _pendingPermissions when the button is tapped.
+        var keyboard = new Telegram.Bot.Types.ReplyMarkups.InlineKeyboardMarkup(new[]
+        {
+            Telegram.Bot.Types.ReplyMarkups.InlineKeyboardButton.WithCallbackData("✅ Once", $"perm:once:{asked.Id}"),
+            Telegram.Bot.Types.ReplyMarkups.InlineKeyboardButton.WithCallbackData("🔁 Always", $"perm:always:{asked.Id}"),
+            Telegram.Bot.Types.ReplyMarkups.InlineKeyboardButton.WithCallbackData("❌ Reject", $"perm:reject:{asked.Id}"),
+        });
+
+        var messageId = await SendAsync(chatId, text, keyboard);
+        if (messageId is { } mid) pending.MessageId = mid;
+    }
+
+    /// <summary>Handles a tap on one of the ✅/🔁/❌ inline buttons attached by
+    /// <see cref="HandlePermissionAskedAsync"/>, replying to OpenCode and updating the message.</summary>
+    private async Task HandleCallbackQueryAsync(Telegram.Bot.Types.CallbackQuery cq)
+    {
+        var data = cq.Data;
+        var chatId = cq.Message?.Chat.Id ?? cq.From.Id;
+        try
+        {
+            if (string.IsNullOrEmpty(data) || !data.StartsWith("perm:"))
+            {
+                await AnswerCallbackAsync(cq.Id, null);
+                return;
+            }
+
+            var parts = data.Split(':', 3);
+            if (parts.Length != 3)
+            {
+                await AnswerCallbackAsync(cq.Id, null);
+                return;
+            }
+            var replyKind = parts[1]; // "once" | "always" | "reject"
+            var requestId = parts[2];
+
+            if (!_pendingPermissions.TryRemove(requestId, out var pending))
+            {
+                await AnswerCallbackAsync(cq.Id, "Already answered or expired.");
+                if (cq.Message is { } staleMsg)
+                    await TryEditAsync(staleMsg.Chat.Id, staleMsg.MessageId, staleMsg.Text + "\n\n(No longer pending.)");
+                return;
+            }
+
+            var session = _openCode.ActiveSessions.FirstOrDefault(s => s.ProjectPath == pending.ProjectPath && !s.Exited);
+            if (session == null)
+            {
+                await AnswerCallbackAsync(cq.Id, "Project server is no longer running.");
+                await TryEditAsync(pending.ChatId, pending.MessageId,
+                    "⚠️ Could not reply — the OpenCode server for this project is no longer running.");
+                return;
+            }
+
+            try
+            {
+                await _openCode.ReplyPermissionAsync(session, requestId, replyKind);
+                var outcome = replyKind switch
+                {
+                    "once" => "✅ Approved (once)",
+                    "always" => "🔁 Always approved",
+                    "reject" => "❌ Rejected",
+                    _ => $"Replied: {replyKind}",
+                };
+                await TryEditAsync(pending.ChatId, pending.MessageId,
+                    $"{outcome}\nProject: {pending.ProjectName}\nAction: {pending.Action}");
+                await AnswerCallbackAsync(cq.Id, null);
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"[permission] reply failed for {requestId}: {ex.Message}");
+                await TryEditAsync(pending.ChatId, pending.MessageId,
+                    $"⚠️ Failed to send your decision to OpenCode: {ex.Message}");
+                await AnswerCallbackAsync(cq.Id, "Failed — see log.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"[permission] callback handling error: {ex.Message}");
+            await AnswerCallbackAsync(cq.Id, null);
+        }
+    }
+
+    private async Task AnswerCallbackAsync(string callbackQueryId, string? text)
+    {
+        if (_client == null) return;
+        try { await _client.AnswerCallbackQuery(callbackQueryId, text); }
+        catch { /* best effort */ }
+    }
+
+    private async Task TryEditAsync(long chatId, long? messageId, string text)
+    {
+        if (_client == null || messageId is not { } mid) return;
+        try { await _client.EditMessageText(chatId, (int)mid, text); }
+        catch { /* best effort — message may have been deleted, or text unchanged */ }
+    }
+
     private async Task FinishAsync(long chatId, long? placeholderId, string text)
     {
         if (placeholderId is { } pid) await TryDeleteAsync(chatId, pid);
@@ -431,12 +583,12 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
 
     // ───────────────────────── Telegram send helpers ─────────────────────────
 
-    private async Task<long?> SendAsync(long chatId, string text)
+    private async Task<long?> SendAsync(long chatId, string text, Telegram.Bot.Types.ReplyMarkups.InlineKeyboardMarkup? replyMarkup = null)
     {
         if (_client == null) return null;
         try
         {
-            var msg = await _client.SendMessage(chatId, text);
+            var msg = await _client.SendMessage(chatId, text, replyMarkup: replyMarkup);
             return msg.MessageId;
         }
         catch (Exception ex)

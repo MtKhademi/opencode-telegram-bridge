@@ -2,7 +2,18 @@ using System.Text.Json;
 using OpenCodeTelegramBridge.Models;
 using OpenCodeTelegramBridge.Services;
 
-var builder = WebApplication.CreateBuilder(args);
+// Resolve all app-relative paths (data/, wwwroot/, appsettings.json) against the directory the
+// executable itself lives in, not the process's current working directory. This makes the app
+// behave identically whether launched via "dotnet run" from the project folder, a published
+// single-file binary invoked from an arbitrary cwd, or a systemd service (whose WorkingDirectory
+// should already be correct, but this removes the dependency on that being set right).
+var appDir = AppContext.BaseDirectory;
+
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+{
+    Args = args,
+    ContentRootPath = appDir,
+});
 builder.WebHost.UseUrls("http://0.0.0.0:5080");
 builder.Logging.ClearProviders();
 builder.Logging.AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; });

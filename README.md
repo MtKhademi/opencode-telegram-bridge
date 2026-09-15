@@ -52,17 +52,124 @@ your projects), click **Save & reconnect**, and watch the status dot and live lo
 turn green / show "Connected as @yourbot". If you pasted a proxy link, the live log will also
 show xray-core being downloaded (first time only) and the local tunnel starting up.
 
-To keep it running in the background (so it survives closing the terminal), use `pm2`,
-`systemd`, or `nohup dotnet run &` — ask me if you'd like a ready-made systemd unit file.
+For everyday use you don't want to run `dotnet run` by hand and keep a terminal open — see
+**"Running it as a service"** below to have it start automatically and stay up persistently,
+like an always-on background service.
 
-### Publishing a standalone binary (optional)
+### Publishing a standalone binary
 
 ```bash
 dotnet publish -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o out
 ./out/OpenCodeTelegramBridge
 ```
 
-(swap `linux-x64` for `win-x64` if you ever run this natively on Windows.)
+(swap `linux-x64` for `win-x64` if you ever run this natively on Windows.) The published binary
+is self-contained (bundles its own .NET runtime) and resolves `data/`, `wwwroot/`, and
+`appsettings.json` relative to **its own location** — not the shell's current directory — so it
+behaves the same no matter where it's launched from (a systemd service, a different terminal,
+etc.). `data/` isn't part of the publish output itself; it's created fresh next to the binary on
+first run (or copy an existing one over, e.g. to carry over your saved config).
+
+## Running it as a service (WSL2 + systemd)
+
+The cleanest way to keep this always up in the background — so you never have to remember to
+start it, and it survives closing terminals / restarting WSL — is a `systemd` **user-independent**
+service, using WSL2's built-in systemd support.
+
+### 1. Enable systemd in WSL (skip if already on)
+
+Check first:
+
+```bash
+systemctl --version
+```
+
+If that errors with something like *"System has not been booted with systemd"*, enable it:
+
+```bash
+sudo tee -a /etc/wsl.conf > /dev/null <<'EOF'
+[boot]
+systemd=true
+EOF
+```
+
+Then, **from Windows PowerShell** (not inside WSL):
+
+```powershell
+wsl --shutdown
+```
+
+Wait a few seconds, then reopen your WSL terminal — `systemctl --version` should now work.
+
+### 2. Publish a self-contained build
+
+```bash
+cd OpenCodeTelegramBridge
+dotnet publish -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o ~/apps/opencode-telegram-bridge
+```
+
+If you already have a working `data/config.json` from a previous `dotnet run`, copy it over so
+the service comes up pre-configured:
+
+```bash
+mkdir -p ~/apps/opencode-telegram-bridge/data
+cp data/config.json ~/apps/opencode-telegram-bridge/data/config.json
+```
+
+### 3. Create the systemd unit
+
+Create `/etc/systemd/system/opencode-telegram-bridge.service` (replace `<username>` with the
+output of `whoami`):
+
+```ini
+[Unit]
+Description=OpenCode Telegram Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/<username>/apps/opencode-telegram-bridge/OpenCodeTelegramBridge
+WorkingDirectory=/home/<username>/apps/opencode-telegram-bridge
+Restart=always
+RestartSec=5
+User=<username>
+Environment=DOTNET_ENVIRONMENT=Production
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 4. Enable and start it
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now opencode-telegram-bridge
+systemctl status opencode-telegram-bridge   # should say "active (running)"
+journalctl -u opencode-telegram-bridge -f   # watch it come up, Ctrl+C when satisfied
+```
+
+From now on it starts automatically every time WSL boots — no `dotnet run`, no open terminal
+required. Whenever you update the code, re-run the `dotnet publish` command from step 2 and then
+`sudo systemctl restart opencode-telegram-bridge`.
+
+### 5. (Optional) Start WSL itself automatically at Windows login
+
+Steps 1–4 make the bridge start as soon as **WSL** boots — but WSL2 itself only boots when
+something triggers it (opening a WSL terminal, a VS Code window attached to WSL, or OpenCode
+launched via WSL). If you want the bridge running even before you've opened anything in WSL that
+session (e.g. right after turning on your PC), have Windows launch WSL automatically at login:
+
+1. Open **Task Scheduler** on Windows.
+2. **Create Task…** (not "Basic Task", so you get the full options).
+3. **General** tab: name it e.g. "Start WSL", and under Security options pick "Run whether user
+   is logged on or not" if you want it to work even without logging in interactively (otherwise
+   the default is fine).
+4. **Triggers** tab → **New…** → "At log on" (optionally restrict to your user).
+5. **Actions** tab → **New…** → Program/script: `wsl.exe`, Add arguments: leave blank (or use
+   `-d <DistroName> -e true` to target a specific distro, e.g. `-d Ubuntu -e true`).
+6. Save. Next time you log into Windows, WSL boots automatically, systemd starts, and this
+   service comes up with it — all before you've opened a single terminal.
 
 ## Using it from Telegram
 
@@ -77,6 +184,11 @@ Once connected, message your bot:
 - `/abort` — cancel an in-progress prompt
 - anything else you type is sent straight to OpenCode as a prompt; you'll get a "🤔 Thinking…"
   placeholder followed by the final response (long responses are split into multiple messages).
+
+If a project's `opencode.json` gates a tool behind `"ask"` permission (e.g. `bash`, `edit`),
+OpenCode will pause and wait for approval. You'll get a Telegram message describing the
+action/resources with three inline buttons — **✅ Once**, **🔁 Always**, **❌ Reject** — tap one
+and the decision is relayed back to OpenCode so it can continue (or stop) accordingly.
 
 ## Where things are stored
 

@@ -257,6 +257,26 @@ public class OpenCodeManager : IDisposable
         catch { /* best effort */ }
     }
 
+    /// <summary>
+    /// Replies to a pending permission request (the legacy `/permission/{requestID}/reply`
+    /// endpoint — confirmed as the one actually wired to live `permission.asked` events on the
+    /// installed OpenCode version; the requestID alone identifies the request, no sessionID
+    /// needed in the path). <paramref name="reply"/> must be "once", "always", or "reject".
+    /// Throws with response detail on non-2xx (e.g. already-answered or unknown request).
+    /// </summary>
+    public async Task ReplyPermissionAsync(ProjectSession session, string requestId, string reply, CancellationToken ct = default)
+    {
+        using var http = MakeAuthedClient(session);
+        var json = JsonSerializer.Serialize(new { reply });
+        var resp = await http.PostAsync($"/permission/{requestId}/reply",
+            new StringContent(json, Encoding.UTF8, "application/json"), ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var detail = await resp.Content.ReadAsStringAsync(ct);
+            throw new InvalidOperationException($"Failed to reply to permission: {(int)resp.StatusCode} {resp.ReasonPhrase} — {detail}");
+        }
+    }
+
     /// <summary>Streams parsed events from opencode's /event SSE endpoint until cancelled.</summary>
     public async IAsyncEnumerable<SseEvent> ListenEventsAsync(ProjectSession session,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
