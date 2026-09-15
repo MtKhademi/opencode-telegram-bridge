@@ -50,6 +50,8 @@ public class TelegramMenuLogicTests
     [InlineData("menu:main", "menu", "main", null)]
     [InlineData("project:select:snap", "project", "select", "snap")]
     [InlineData("model:refresh", "model", "refresh", null)]
+    [InlineData("section:select:snap", "section", "select", "snap")]
+    [InlineData("command:run:snap", "command", "run", "snap")]
     public void ParseCallback_RoutesKnownCallbacks(string data, string prefix, string action, string? value)
     {
         var route = TelegramMenuLogic.ParseCallback(data);

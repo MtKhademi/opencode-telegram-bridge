@@ -3,6 +3,8 @@ namespace OpenCodeTelegramBridge.Models;
 public enum MenuItemKind
 {
     Project,
+    Section,
+    Command,
     Model,
     Provider,
 }

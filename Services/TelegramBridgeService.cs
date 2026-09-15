@@ -23,6 +23,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
 
     private readonly ConfigStore _configStore;
     private readonly OpenCodeManager _openCode;
+    private readonly ProjectConfigLoader _projectConfigLoader;
     private readonly ProxyTunnelManager _proxyTunnel;
     private readonly ActivityLog _log;
     private readonly ConcurrentDictionary<long, ChatState> _chatStates = new();
@@ -42,10 +43,11 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     public long BotId { get; private set; }
     public string? LastError { get; private set; }
 
-    public TelegramBridgeService(ConfigStore configStore, OpenCodeManager openCode, ProxyTunnelManager proxyTunnel, ActivityLog log)
+    public TelegramBridgeService(ConfigStore configStore, OpenCodeManager openCode, ProjectConfigLoader projectConfigLoader, ProxyTunnelManager proxyTunnel, ActivityLog log)
     {
         _configStore = configStore;
         _openCode = openCode;
+        _projectConfigLoader = projectConfigLoader;
         _proxyTunnel = proxyTunnel;
         _log = log;
     }
@@ -173,6 +175,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             if (string.IsNullOrEmpty(text)) return;
 
             if (text.StartsWith('/')) await HandleCommandAsync(chatId, m.From?.Id ?? chatId, text);
+            else if (await TryRunPendingCommandAsync(chatId, text)) return;
             else await RunPromptAsync(chatId, text);
         }
         catch (Exception ex)
@@ -217,6 +220,10 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             case "/model":
                 await SelectModelByTextAsync(chatId, userId, arg);
                 break;
+            case "/section":
+            case "/sections":
+                await ShowSectionsAsync(chatId, userId);
+                break;
             case "/status":
                 await ShowStatusAsync(chatId, userId);
                 break;
@@ -237,22 +244,28 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         CleanupSnapshots();
         var state = GetState(chatId);
         var projectName = GetSelectedProjectName(state.ProjectPath) ?? "انتخاب نشده";
+        var sectionTitle = GetSelectedSectionTitle(state) ?? "انتخاب نشده";
         var model = state.Model ?? "پیش‌فرض OpenCode";
-        var running = state.ProjectPath != null && IsProjectRunning(state.ProjectPath);
+        var workingDirectory = GetCurrentWorkingDirectory(state);
+        var running = workingDirectory != null && IsProjectRunning(workingDirectory);
         var text =
             (string.IsNullOrWhiteSpace(prefix) ? "" : prefix.TrimEnd() + "\n\n") +
             "منوی OpenCode Telegram Bridge\n\n" +
             $"پروژه: {projectName}\n" +
+            $"بخش: {sectionTitle}\n" +
             $"مدل: {model}\n" +
-            $"سرور پروژه: {(running ? "در حال اجرا" : "متوقف")}";
+            $"سرور بخش: {(running ? "در حال اجرا" : "متوقف")}";
 
-        var keyboard = new InlineKeyboardMarkup(new[]
+        var rows = new List<InlineKeyboardButton[]>
         {
-            new[] { InlineKeyboardButton.WithCallbackData("📁 پروژه‌ها", "menu:projects"), InlineKeyboardButton.WithCallbackData("🧠 تغییر مدل", "menu:models") },
+            new[] { InlineKeyboardButton.WithCallbackData("📁 پروژه‌ها", "menu:projects"), InlineKeyboardButton.WithCallbackData("🧩 تغییر بخش", "menu:sections") },
+            new[] { InlineKeyboardButton.WithCallbackData("⚡ اقدام‌ها", "menu:actions"), InlineKeyboardButton.WithCallbackData("🧠 تغییر مدل", "menu:models") },
             new[] { InlineKeyboardButton.WithCallbackData("📊 وضعیت", "menu:status"), InlineKeyboardButton.WithCallbackData("⏹ لغو درخواست", "menu:abort") },
-            new[] { InlineKeyboardButton.WithCallbackData("🛑 توقف سرور پروژه", "menu:stop") },
+            new[] { InlineKeyboardButton.WithCallbackData("🛑 توقف سرور بخش", "menu:stop") },
+            new[] { InlineKeyboardButton.WithCallbackData("🔄 بارگذاری مجدد تنظیمات پروژه", "menu:reload") },
             new[] { InlineKeyboardButton.WithCallbackData("❓ راهنما", "menu:help") },
-        });
+        };
+        var keyboard = new InlineKeyboardMarkup(rows);
         await SendOrEditMenuAsync(chatId, messageId, text, keyboard);
     }
 
@@ -329,9 +342,222 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         }
         var gate = GetChatLock(chatId);
         await gate.WaitAsync();
-        try { GetState(chatId).ProjectPath = match.Path; }
+        try
+        {
+            var state = GetState(chatId);
+            state.ProjectPath = match.Path;
+            state.SectionId = null;
+            state.SectionWorkingDirectory = null;
+            state.PendingCommand = null;
+        }
         finally { gate.Release(); }
-        await ShowMainMenuAsync(chatId, userId, messageId, $"✅ پروژه '{match.Name}' انتخاب شد.");
+
+        var config = _projectConfigLoader.Load(match.Path, match.Name);
+        if (config.IsValid)
+            await ShowSectionsAsync(chatId, userId, messageId, $"✅ پروژه '{config.Config!.Name}' انتخاب شد. حالا بخش را انتخاب کنید.");
+        else if (config.Exists)
+            await ShowMainMenuAsync(chatId, userId, messageId, $"✅ پروژه '{match.Name}' انتخاب شد، اما telegram-bridge.json معتبر نیست:\n{config.Error}");
+        else
+            await ShowMainMenuAsync(chatId, userId, messageId, $"✅ پروژه '{match.Name}' انتخاب شد.");
+    }
+
+    private async Task ShowSectionsAsync(long chatId, long userId, int? messageId = null, string? prefix = null, int page = 0)
+    {
+        var state = GetState(chatId);
+        var projectPath = state.ProjectPath;
+        if (projectPath == null)
+        {
+            await ShowProjectsAsync(chatId, userId, messageId, prefix: "ابتدا پروژه را انتخاب کنید.");
+            return;
+        }
+        var project = _openCode.DiscoverProjects().FirstOrDefault(p => p.Path == projectPath);
+        if (project == default)
+        {
+            state.ProjectPath = null;
+            state.SectionId = null;
+            state.SectionWorkingDirectory = null;
+            state.PendingCommand = null;
+            await ShowProjectsAsync(chatId, userId, messageId, prefix: "پروژه انتخاب‌شده دیگر وجود ندارد.");
+            return;
+        }
+        var loaded = _projectConfigLoader.Load(project.Path, project.Name);
+        if (!loaded.Exists)
+        {
+            state.SectionId = null;
+            state.SectionWorkingDirectory = null;
+            await ShowMainMenuAsync(chatId, userId, messageId, "این پروژه فایل telegram-bridge.json ندارد و با حالت ریشه پروژه اجرا می‌شود.");
+            return;
+        }
+        if (!loaded.IsValid)
+        {
+            await SendOrEditMenuAsync(chatId, messageId, $"telegram-bridge.json معتبر نیست:\n{loaded.Error}", new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("🔄 تلاش دوباره", "menu:reload") },
+                new[] { InlineKeyboardButton.WithCallbackData("📁 تغییر پروژه", "menu:projects") },
+                new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") },
+            }));
+            return;
+        }
+        var config = loaded.Config!;
+        if (config.Sections.Count == 0)
+        {
+            await SendOrEditMenuAsync(chatId, messageId, "این پروژه هیچ بخشی تعریف نکرده است.", MainMenuOnlyKeyboard());
+            return;
+        }
+        var snapshot = CreateSnapshot(chatId, userId, messageId ?? 0);
+        var rows = new List<InlineKeyboardButton[]>();
+        page = Math.Clamp(page, 0, Math.Max(0, (config.Sections.Count - 1) / PageSize));
+        foreach (var section in config.Sections.Skip(page * PageSize).Take(PageSize))
+        {
+            var token = AddToken(snapshot, MenuItemKind.Section, section.Id);
+            var selected = state.SectionId == section.Id ? "✅ " : "";
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData(selected + section.Title, $"section:select:{snapshot.Id}:{token}") });
+        }
+        AddPager(rows, "section:page", snapshot.Id, page, config.Sections.Count);
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("📁 تغییر پروژه", "menu:projects"), InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") });
+        var text = (prefix is null ? "" : prefix + "\n\n") + $"🧩 بخش پروژه {config.Name} را انتخاب کنید:";
+        var sentId = await SendOrEditMenuAsync(chatId, messageId, text, new InlineKeyboardMarkup(rows));
+        snapshot.MessageId = (int)(sentId ?? messageId ?? 0);
+    }
+
+    private async Task SelectSectionAsync(long chatId, long userId, string sectionId, int? messageId = null)
+    {
+        var state = GetState(chatId);
+        if (state.ProjectPath == null)
+        {
+            await ShowProjectsAsync(chatId, userId, messageId, prefix: "ابتدا پروژه را انتخاب کنید.");
+            return;
+        }
+        var project = _openCode.DiscoverProjects().FirstOrDefault(p => p.Path == state.ProjectPath);
+        if (project == default)
+        {
+            await ShowProjectsAsync(chatId, userId, messageId, prefix: "پروژه انتخاب‌شده دیگر وجود ندارد.");
+            return;
+        }
+        var loaded = _projectConfigLoader.Load(project.Path, project.Name);
+        if (!loaded.IsValid)
+        {
+            await ShowSectionsAsync(chatId, userId, messageId, "تنظیمات پروژه معتبر نیست یا تغییر کرده است.");
+            return;
+        }
+        var section = loaded.Config!.Sections.FirstOrDefault(s => string.Equals(s.Id, sectionId, StringComparison.OrdinalIgnoreCase));
+        if (section == null)
+        {
+            await ShowSectionsAsync(chatId, userId, messageId, "این بخش دیگر وجود ندارد.");
+            return;
+        }
+        var gate = GetChatLock(chatId);
+        await gate.WaitAsync();
+        try
+        {
+            state.SectionId = section.Id;
+            state.SectionWorkingDirectory = section.ResolvedDirectory;
+            state.PendingCommand = null;
+        }
+        finally { gate.Release(); }
+        await ShowSectionMenuAsync(chatId, userId, messageId, $"✅ بخش '{section.Title}' انتخاب شد.");
+    }
+
+    private async Task ShowSectionMenuAsync(long chatId, long userId, int? messageId = null, string? prefix = null, int page = 0)
+    {
+        var state = GetState(chatId);
+        var section = GetCurrentSection(state, out var loaded);
+        if (state.ProjectPath == null)
+        {
+            await ShowProjectsAsync(chatId, userId, messageId, prefix: "ابتدا پروژه را انتخاب کنید.");
+            return;
+        }
+        if (loaded?.Exists == false)
+        {
+            await ShowMainMenuAsync(chatId, userId, messageId, "این پروژه تنظیمات بخشی ندارد.");
+            return;
+        }
+        if (loaded?.IsValid != true || section == null)
+        {
+            await ShowSectionsAsync(chatId, userId, messageId, "ابتدا یک بخش معتبر انتخاب کنید.");
+            return;
+        }
+        var commands = section.Commands;
+        page = Math.Clamp(page, 0, Math.Max(0, (commands.Count - 1) / PageSize));
+        var snapshot = CreateSnapshot(chatId, userId, messageId ?? 0);
+        var rows = new List<InlineKeyboardButton[]>();
+        foreach (var command in commands.Skip(page * PageSize).Take(PageSize))
+        {
+            var token = AddToken(snapshot, MenuItemKind.Command, command.Id);
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData(command.Title, $"command:run:{snapshot.Id}:{token}") });
+        }
+        AddPager(rows, "command:page", snapshot.Id, page, commands.Count);
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🧩 تغییر بخش", "menu:sections"), InlineKeyboardButton.WithCallbackData("📁 تغییر پروژه", "menu:projects") });
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🧠 تغییر مدل", "menu:models"), InlineKeyboardButton.WithCallbackData("📊 وضعیت", "menu:status") });
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔄 بارگذاری مجدد", "menu:reload"), InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "menu:main") });
+        var text = (prefix is null ? "" : prefix + "\n\n") + $"⚡ اقدام‌های بخش {section.Title}:" + (commands.Count == 0 ? "\nبرای این بخش اقدامی تعریف نشده است. پیام عادی شما در همین بخش اجرا می‌شود." : "");
+        var sentId = await SendOrEditMenuAsync(chatId, messageId, text, new InlineKeyboardMarkup(rows));
+        snapshot.MessageId = (int)(sentId ?? messageId ?? 0);
+    }
+
+    private async Task RunConfiguredCommandAsync(long chatId, long userId, string commandId, int? messageId = null)
+    {
+        var state = GetState(chatId);
+        var section = GetCurrentSection(state, out var loaded);
+        if (loaded?.IsValid != true || section == null)
+        {
+            await ShowSectionsAsync(chatId, userId, messageId, "بخش انتخاب‌شده معتبر نیست.");
+            return;
+        }
+        var command = section.Commands.FirstOrDefault(c => string.Equals(c.Id, commandId, StringComparison.OrdinalIgnoreCase));
+        if (command == null)
+        {
+            await ShowSectionMenuAsync(chatId, userId, messageId, "این اقدام دیگر وجود ندارد.");
+            return;
+        }
+        if (command.Type == "prompt")
+        {
+            await SendOrEditMenuAsync(chatId, messageId, $"در حال اجرای اقدام: {command.Title}", MainMenuOnlyKeyboard());
+            await RunPromptAsync(chatId, command.Text!);
+            return;
+        }
+        if (command.Type == "opencode-command")
+        {
+            var slashCommand = "/" + command.Command!.TrimStart('/');
+            if (command.AskForArguments)
+            {
+                var gate = GetChatLock(chatId);
+                await gate.WaitAsync();
+                try
+                {
+                    state.PendingCommand = new PendingCommandInput
+                    {
+                        ProjectPath = state.ProjectPath!,
+                        SectionId = section.Id,
+                        WorkingDirectory = section.ResolvedDirectory,
+                        Command = slashCommand,
+                        Title = command.Title,
+                    };
+                }
+                finally { gate.Release(); }
+                await SendOrEditMenuAsync(chatId, messageId, $"آرگومان‌های '{command.Title}' را در پیام بعدی بفرستید. برای اجرای بدون آرگومان فقط '-' را بفرستید.", MainMenuOnlyKeyboard());
+                return;
+            }
+            await RunPromptAsync(chatId, slashCommand);
+        }
+    }
+
+    private async Task<bool> TryRunPendingCommandAsync(long chatId, string text)
+    {
+        PendingCommandInput? pending;
+        var gate = GetChatLock(chatId);
+        await gate.WaitAsync();
+        try
+        {
+            var state = GetState(chatId);
+            pending = state.PendingCommand;
+            state.PendingCommand = null;
+        }
+        finally { gate.Release(); }
+        if (pending == null) return false;
+        var args = text.Trim() == "-" ? "" : " " + text.Trim();
+        await RunPromptInContextAsync(chatId, pending.WorkingDirectory, pending.Command + args, GetState(chatId).Model);
+        return true;
     }
 
     private async Task ShowModelProvidersAsync(long chatId, long userId, int? messageId = null, bool refresh = false, string? prefix = null)
@@ -458,18 +684,20 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
     private async Task ShowStatusAsync(long chatId, long userId, int? messageId = null)
     {
         var state = GetState(chatId);
+        var workingDirectory = GetCurrentWorkingDirectory(state);
         var text =
             $"📊 وضعیت\n\nپروژه: {GetSelectedProjectName(state.ProjectPath) ?? "انتخاب نشده"}\n" +
+            $"بخش: {GetSelectedSectionTitle(state) ?? "انتخاب نشده"}\n" +
             $"مدل: {state.Model ?? "پیش‌فرض OpenCode"}\n" +
-            $"سرور پروژه: {(state.ProjectPath != null && IsProjectRunning(state.ProjectPath) ? "در حال اجرا" : "متوقف")}";
+            $"سرور بخش: {(workingDirectory != null && IsProjectRunning(workingDirectory) ? "در حال اجرا" : "متوقف")}";
         await SendOrEditMenuAsync(chatId, messageId, text, MainMenuOnlyKeyboard());
     }
 
     private async Task StopProjectServerAsync(long chatId, long userId, int? messageId = null)
     {
-        var projectPath = GetState(chatId).ProjectPath;
-        if (projectPath != null) await _openCode.StopAsync(projectPath);
-        await ShowMainMenuAsync(chatId, userId, messageId, projectPath == null ? "پروژه‌ای انتخاب نشده است." : "🛑 سرور پروژه متوقف شد.");
+        var workingDirectory = GetCurrentWorkingDirectory(GetState(chatId));
+        if (workingDirectory != null) await _openCode.StopAsync(workingDirectory);
+        await ShowMainMenuAsync(chatId, userId, messageId, workingDirectory == null ? "پروژه یا بخش انتخاب نشده است." : "🛑 سرور بخش متوقف شد.");
     }
 
     private async Task AbortPromptAsync(long chatId, long userId, int? messageId = null)
@@ -508,18 +736,29 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             return;
         }
 
+        var workingDirectory = GetCurrentWorkingDirectory(GetState(chatId));
+        if (workingDirectory == null)
+        {
+            await ShowSectionsAsync(chatId, chatId, prefix: "برای این پروژه ابتدا یک بخش انتخاب کنید.");
+            return;
+        }
+        await RunPromptInContextAsync(chatId, workingDirectory, text, model);
+    }
+
+    private async Task RunPromptInContextAsync(long chatId, string workingDirectory, string text, string? model)
+    {
         if (_inFlight.TryRemove(chatId, out var previous)) previous.Cancellation.Cancel();
-        var execution = new PromptExecution { Cancellation = new CancellationTokenSource(), ProjectPath = projectPath };
+        var execution = new PromptExecution { Cancellation = new CancellationTokenSource(), ProjectPath = workingDirectory };
         _inFlight[chatId] = execution;
         var ct = execution.Cancellation.Token;
 
         long? placeholderId = null;
         try
         {
-            var wasRunning = IsProjectRunning(projectPath);
+            var wasRunning = IsProjectRunning(workingDirectory);
             if (!wasRunning) placeholderId = await SendAsync(chatId, "⏳ در حال راه‌اندازی سرور OpenCode…");
 
-            var session = await _openCode.GetOrStartAsync(projectPath, ct);
+            var session = await _openCode.GetOrStartAsync(workingDirectory, ct);
             var openCodeSessionId = await _openCode.CreateOpenCodeSessionAsync(session, ct);
             execution.OpenCodeSessionId = openCodeSessionId;
 
@@ -567,7 +806,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
                         }
                         break;
                     case "permission.asked":
-                        if (MatchesSession(evt.Properties, openCodeSessionId)) await HandlePermissionAskedAsync(chatId, projectPath, evt.Properties);
+                        if (MatchesSession(evt.Properties, openCodeSessionId)) await HandlePermissionAskedAsync(chatId, workingDirectory, evt.Properties);
                         break;
                 }
             }
@@ -672,8 +911,14 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
                 case "project":
                     await HandleProjectCallbackAsync(chatId, cq.From.Id, messageId, parts);
                     break;
-                case "model":
+                    case "model":
                     await HandleModelCallbackAsync(chatId, cq.From.Id, messageId, parts);
+                    break;
+                case "section":
+                    await HandleSectionCallbackAsync(chatId, cq.From.Id, messageId, parts);
+                    break;
+                case "command":
+                    await HandleCommandCallbackAsync(chatId, cq.From.Id, messageId, parts);
                     break;
             }
         }
@@ -692,6 +937,9 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             case "main": await ShowMainMenuAsync(chatId, userId, messageId); break;
             case "projects": await ShowProjectsAsync(chatId, userId, messageId); break;
             case "models": await ShowModelProvidersAsync(chatId, userId, messageId, refresh: true); break;
+            case "sections": await ShowSectionsAsync(chatId, userId, messageId); break;
+            case "actions": await ShowSectionMenuAsync(chatId, userId, messageId); break;
+            case "reload": await ReloadProjectConfigAsync(chatId, userId, messageId); break;
             case "status": await ShowStatusAsync(chatId, userId, messageId); break;
             case "abort": await AbortPromptAsync(chatId, userId, messageId); break;
             case "stop": await StopProjectServerAsync(chatId, userId, messageId); break;
@@ -746,6 +994,49 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             return;
         }
         await SendOrEditMenuAsync(chatId, messageId, "این دکمه منقضی شده است. منوی مدل را دوباره باز کنید.", ChangeModelOnlyKeyboard());
+    }
+
+    private async Task HandleSectionCallbackAsync(long chatId, long userId, int? messageId, string[] parts)
+    {
+        if (parts.Length == 4 && parts[1] == "page" && int.TryParse(parts[3], out var page))
+        {
+            await ShowSectionsAsync(chatId, userId, messageId, page: page);
+            return;
+        }
+        if (parts.Length == 4 && parts[1] == "select" && TryResolveToken(parts[2], parts[3], chatId, userId, messageId, MenuItemKind.Section, out var token))
+            await SelectSectionAsync(chatId, userId, token.Value, messageId);
+        else
+            await ShowSectionsAsync(chatId, userId, messageId, "این دکمه منقضی شده است. فهرست بخش‌ها را تازه کنید.");
+    }
+
+    private async Task HandleCommandCallbackAsync(long chatId, long userId, int? messageId, string[] parts)
+    {
+        if (parts.Length == 4 && parts[1] == "run" && TryResolveToken(parts[2], parts[3], chatId, userId, messageId, MenuItemKind.Command, out var token))
+        {
+            await RunConfiguredCommandAsync(chatId, userId, token.Value, messageId);
+            return;
+        }
+        if (parts.Length == 4 && parts[1] == "page" && int.TryParse(parts[3], out var page))
+        {
+            await ShowSectionMenuAsync(chatId, userId, messageId, page: page);
+            return;
+        }
+        await ShowSectionMenuAsync(chatId, userId, messageId, "این دکمه منقضی شده است. فهرست اقدام‌ها را تازه کنید.");
+    }
+
+    private async Task ReloadProjectConfigAsync(long chatId, long userId, int? messageId)
+    {
+        var state = GetState(chatId);
+        if (state.ProjectPath == null)
+        {
+            await ShowProjectsAsync(chatId, userId, messageId, prefix: "ابتدا پروژه را انتخاب کنید.");
+            return;
+        }
+        var section = GetCurrentSection(state, out var loaded);
+        if (loaded?.IsValid == true && section != null)
+            await ShowSectionMenuAsync(chatId, userId, messageId, "تنظیمات پروژه دوباره خوانده شد.");
+        else
+            await ShowSectionsAsync(chatId, userId, messageId, "تنظیمات پروژه دوباره خوانده شد.");
     }
 
     private async Task HandlePermissionCallbackAsync(CallbackQuery cq, string data)
@@ -848,6 +1139,36 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         buttons.Add(InlineKeyboardButton.WithCallbackData($"{page + 1}/{maxPage + 1}", "menu:noop"));
         if (page < maxPage) buttons.Add(InlineKeyboardButton.WithCallbackData("بعدی ➡️", $"{baseData}:{page + 1}"));
         rows.Add(buttons.ToArray());
+    }
+
+    private string? GetCurrentWorkingDirectory(ChatState state)
+    {
+        if (state.ProjectPath == null) return null;
+        var project = _openCode.DiscoverProjects().FirstOrDefault(p => p.Path == state.ProjectPath);
+        if (project == default) return null;
+        var loaded = _projectConfigLoader.Load(project.Path, project.Name);
+        if (!loaded.Exists) return project.Path;
+        if (!loaded.IsValid || string.IsNullOrWhiteSpace(state.SectionId)) return null;
+        var section = loaded.Config!.Sections.FirstOrDefault(s => string.Equals(s.Id, state.SectionId, StringComparison.OrdinalIgnoreCase));
+        return section?.ResolvedDirectory;
+    }
+
+    private TelegramBridgeSectionConfig? GetCurrentSection(ChatState state, out ProjectConfigLoadResult? loaded)
+    {
+        loaded = null;
+        if (state.ProjectPath == null) return null;
+        var project = _openCode.DiscoverProjects().FirstOrDefault(p => p.Path == state.ProjectPath);
+        if (project == default) return null;
+        loaded = _projectConfigLoader.Load(project.Path, project.Name);
+        if (!loaded.IsValid || string.IsNullOrWhiteSpace(state.SectionId)) return null;
+        return loaded.Config!.Sections.FirstOrDefault(s => string.Equals(s.Id, state.SectionId, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private string? GetSelectedSectionTitle(ChatState state)
+    {
+        var section = GetCurrentSection(state, out var loaded);
+        if (loaded?.Exists == false) return "ریشه پروژه";
+        return section?.Title;
     }
 
     private bool IsProjectRunning(string projectPath) => _openCode.ActiveSessions.Any(s => s.ProjectPath == projectPath && !s.Exited);

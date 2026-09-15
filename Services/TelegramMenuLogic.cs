@@ -41,6 +41,8 @@ public static class TelegramMenuLogic
             "menu" when parts.Length >= 2 => new CallbackRoute("menu", parts[1], parts.Length > 2 ? parts[2] : null),
             "project" when parts.Length >= 2 => new CallbackRoute("project", parts[1], parts.Length > 2 ? parts[2] : null),
             "model" when parts.Length >= 2 => new CallbackRoute("model", parts[1], parts.Length > 2 ? parts[2] : null),
+            "section" when parts.Length >= 2 => new CallbackRoute("section", parts[1], parts.Length > 2 ? parts[2] : null),
+            "command" when parts.Length >= 2 => new CallbackRoute("command", parts[1], parts.Length > 2 ? parts[2] : null),
             _ => CallbackRoute.Invalid,
         };
     }

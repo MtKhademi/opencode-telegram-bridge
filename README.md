@@ -192,8 +192,71 @@ Once connected, message your bot:
   The last response message includes a **🏠 منوی اصلی** button.
 
 The menu UI is Persian for user-facing labels/messages, while project names, model identifiers,
-and text commands stay unchanged. Project selection does not start an OpenCode server; the server
-still starts lazily on the first prompt for that project.
+and text commands stay unchanged. Project/section selection does not start an OpenCode server; the
+server still starts lazily on the first prompt or predefined action for that context.
+
+### Per-project Telegram configuration
+
+A project can opt into section/action buttons by adding `telegram-bridge.json` directly in its
+root. Projects without this file keep the legacy behavior: prompts run from the discovered project
+root.
+
+Version 1 example:
+
+```json
+{
+  "version": 1,
+  "name": "TenantForge",
+  "sections": [
+    {
+      "id": "backend",
+      "title": "بک‌اند",
+      "directory": "./backend",
+      "commands": [
+        {
+          "id": "backend-task",
+          "title": "اجرای تسک بک‌اند",
+          "type": "opencode-command",
+          "command": "backend-task",
+          "askForArguments": true
+        }
+      ]
+    },
+    {
+      "id": "main",
+      "title": "مدیریت پروژه",
+      "directory": ".",
+      "commands": [
+        {
+          "id": "review-status",
+          "title": "بررسی وضعیت پروژه",
+          "type": "prompt",
+          "text": "Review the project instructions and current state. Summarize progress, blockers, and the next recommended task."
+        }
+      ]
+    }
+  ]
+}
+```
+
+Rules:
+
+- `version` is required and only `1` is supported.
+- `name` is optional and defaults to the discovered project folder name.
+- Section IDs must be unique per project; command IDs must be unique per section.
+- Section `title` and `directory` are required. `commands` may be empty.
+- Section directories are resolved relative to the config file's directory, must exist, must stay
+  inside the project root, and symlink/junction segments are rejected.
+- Supported command types are `opencode-command` and `prompt`; arbitrary shell execution is not
+  supported.
+- `opencode-command.command` is stored without a leading slash; the bridge sends it to OpenCode as
+  `/command-name` when executed.
+- `askForArguments` defaults to false; when true, the next normal Telegram message is appended as
+  arguments. Send `-` to run it without arguments.
+
+When a configured project is selected, the bot asks you to choose a section. Ordinary prompts and
+predefined actions then run in the selected section's resolved working directory. Switching projects
+clears the selected section and any pending command-argument input; model selection is preserved.
 
 Menu buttons use short-lived server-side snapshots so Telegram callback data stays under the
 64-byte Bot API limit and never embeds full project paths or long model IDs. Old buttons can expire
