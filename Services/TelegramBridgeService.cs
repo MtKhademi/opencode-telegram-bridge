@@ -203,8 +203,14 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         {
             case "/start":
             case "/menu":
+            {
+                var gate = GetChatLock(chatId);
+                await gate.WaitAsync();
+                try { GetState(chatId).PendingCommand = null; }
+                finally { gate.Release(); }
                 await ShowMainMenuAsync(chatId, userId);
                 break;
+            }
             case "/help":
                 await SendAsync(chatId, HelpText(), MainMenuOnlyKeyboard());
                 break;
@@ -518,7 +524,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         }
         if (command.Type == "opencode-command")
         {
-            var slashCommand = "/" + command.Command!.TrimStart('/');
+            var commandName = command.Command!.TrimStart('/');
             if (command.AskForArguments)
             {
                 var gate = GetChatLock(chatId);
@@ -530,15 +536,15 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
                         ProjectPath = state.ProjectPath!,
                         SectionId = section.Id,
                         WorkingDirectory = section.ResolvedDirectory,
-                        Command = slashCommand,
+                        Command = commandName,
                         Title = command.Title,
                     };
                 }
                 finally { gate.Release(); }
-                await SendOrEditMenuAsync(chatId, messageId, $"آرگومان‌های '{command.Title}' را در پیام بعدی بفرستید. برای اجرای بدون آرگومان فقط '-' را بفرستید.", MainMenuOnlyKeyboard());
+                await SendOrEditMenuAsync(chatId, messageId, $"دستور /{commandName} انتخاب شده است. فقط آرگومان‌ها (مثلاً شناسهٔ تسک) را بفرستید؛ نام دستور را دوباره ننویسید. برای اجرای بدون آرگومان '-' و برای انصراف /menu را بفرستید.", MainMenuOnlyKeyboard());
                 return;
             }
-            await RunPromptAsync(chatId, slashCommand);
+            await RunPromptInContextAsync(chatId, section.ResolvedDirectory, "", state.Model, commandName);
         }
     }
 
@@ -555,8 +561,8 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         }
         finally { gate.Release(); }
         if (pending == null) return false;
-        var args = text.Trim() == "-" ? "" : " " + text.Trim();
-        await RunPromptInContextAsync(chatId, pending.WorkingDirectory, pending.Command + args, GetState(chatId).Model);
+        var args = text.Trim() == "-" ? "" : text;
+        await RunPromptInContextAsync(chatId, pending.WorkingDirectory, args, GetState(chatId).Model, pending.Command);
         return true;
     }
 
@@ -745,7 +751,7 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         await RunPromptInContextAsync(chatId, workingDirectory, text, model);
     }
 
-    private async Task RunPromptInContextAsync(long chatId, string workingDirectory, string text, string? model)
+    private async Task RunPromptInContextAsync(long chatId, string workingDirectory, string text, string? model, string? command = null)
     {
         if (_inFlight.TryRemove(chatId, out var previous)) previous.Cancellation.Cancel();
         var execution = new PromptExecution { Cancellation = new CancellationTokenSource(), ProjectPath = workingDirectory };
@@ -761,6 +767,15 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
             var session = await _openCode.GetOrStartAsync(workingDirectory, ct);
             var openCodeSessionId = await _openCode.CreateOpenCodeSessionAsync(session, ct);
             execution.OpenCodeSessionId = openCodeSessionId;
+
+            if (command != null)
+            {
+                placeholderId ??= await SendAsync(chatId, "⏳ در حال اجرای دستور OpenCode…");
+                var result = await _openCode.RunCommandAsync(session, openCodeSessionId, command, text, model,
+                    properties => HandlePermissionAskedAsync(chatId, workingDirectory, properties), ct);
+                await FinishAsync(chatId, placeholderId, result);
+                return;
+            }
 
             var accumulated = new StringBuilder();
             var thinkingStarted = false;
@@ -789,7 +804,6 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
                         if (MatchesSession(evt.Properties, openCodeSessionId))
                         {
                             await FinishAsync(chatId, placeholderId, accumulated.ToString());
-                            _inFlight.TryRemove(chatId, out _);
                             return;
                         }
                         break;
@@ -801,7 +815,6 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
                                 : "خطای نامشخص";
                             if (placeholderId is { } pid) await TryDeleteAsync(chatId, pid);
                             await SendAsync(chatId, $"❌ خطا: {msg}", MainMenuOnlyKeyboard());
-                            _inFlight.TryRemove(chatId, out _);
                             return;
                         }
                         break;
@@ -824,7 +837,8 @@ public class TelegramBridgeService : IHostedService, IAsyncDisposable
         }
         finally
         {
-            _inFlight.TryRemove(chatId, out _);
+            ((ICollection<KeyValuePair<long, PromptExecution>>)_inFlight)
+                .Remove(new KeyValuePair<long, PromptExecution>(chatId, execution));
         }
     }
 
