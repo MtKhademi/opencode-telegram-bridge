@@ -230,6 +230,17 @@ public class OpenCodeManager : IDisposable
         }
     }
 
+    public async Task<string> RunCommandAsync(ProjectSession session, string openCodeSessionId,
+        string command, string arguments, string? model, Func<JsonElement, Task> onPermission,
+        CancellationToken ct = default)
+    {
+        session.LastActivity = DateTime.UtcNow;
+        using var http = MakeAuthedClient(session);
+        http.Timeout = Timeout.InfiniteTimeSpan;
+        return await new OpenCodeCommandRunner(http).RunAsync(
+            openCodeSessionId, command, arguments, model, onPermission, ct);
+    }
+
     public async Task AbortAsync(ProjectSession session, string openCodeSessionId, CancellationToken ct = default)
     {
         try

@@ -249,10 +249,39 @@ Rules:
   inside the project root, and symlink/junction segments are rejected.
 - Supported command types are `opencode-command` and `prompt`; arbitrary shell execution is not
   supported.
-- `opencode-command.command` is stored without a leading slash; the bridge sends it to OpenCode as
-  `/command-name` when executed.
-- `askForArguments` defaults to false; when true, the next normal Telegram message is appended as
-  arguments. Send `-` to run it without arguments.
+- `opencode-command.command` is stored without a leading slash. The bridge executes it through
+  `POST /session/{id}/command`, passing command name and arguments separately. It does not send
+  slash-command text as a normal prompt. OpenCode resolves the command's configured agent (for
+  example `agent: backend-mentor`) and that agent's permissions in the selected working directory.
+- `askForArguments` defaults to false; when true, the next normal Telegram message supplies the
+  arguments. Do not enter the command name again. Send `-` to run it without arguments, or `/menu`
+  to cancel. For a no-argument task button, set `askForArguments` to false.
+- The command event subscription starts before dispatch so permission requests can be answered
+  while the command HTTP request is pending. Final text comes from the completed command response.
+  Missing commands/API errors are reported without silently falling back to ordinary prompts.
+
+### Command permissions and deployment
+
+This routing fix applies to every configured project; it does not grant permissions globally.
+Permissions remain in each project's OpenCode configuration and agent definitions. TenantForge's
+`backend-task` command selects `backend-mentor`, whose tracked bash policy already allows routine
+commands while denying specific destructive operations. Sending `/backend-task` as ordinary prompt
+text could instead use the default `plan` agent and trigger repeated approval requests.
+
+After updating and republishing the bridge, restart it when no task is active and retry the command
+button. Ensure the working clone also contains the current `.opencode/commands` and `.opencode/agents`
+files. The local OpenCode version must support the documented command endpoint, string model ID,
+`server.connected` event, and existing `permission.asked` events. See the
+[OpenCode server API](https://opencode.ai/docs/server/#messages).
+
+For a live smoke test, use a harmless custom command assigned to an agent with a known bash policy.
+Run it through its Telegram button and verify the agent, expected approval behavior, and final
+response; repeat with a command that requires approval. A successful HTTP reply is not proof that
+all application work succeeded. The runner also checks OpenCode's returned message error.
+
+The bridge still creates a new OpenCode session per request. `Always` approvals are session-scoped,
+not permanent configuration. Multi-turn session continuity is a separate limitation; this change
+does not turn permission approvals or normal replies into a persistent task conversation.
 
 When a configured project is selected, the bot asks you to choose a section. Ordinary prompts and
 predefined actions then run in the selected section's resolved working directory. Switching projects
